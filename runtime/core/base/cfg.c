@@ -347,6 +347,7 @@ static const CfgRow rows[] = {
     K("LIST_WATCH"),
     K("LOCALE"),
     K("LOGIC_HZ_TT"),
+    K("MEMCPY_HOLD"),
     K("MENU_TEST"),
     K("MENU_TEST_DIR"),
     K("MENU_TEST_SET"),
@@ -727,6 +728,11 @@ static const struct { const char *key, *value; } PS5[] = {
     // 99.6 % of a 1.8.0 race's re-uploads (2,789 of 2,801, 678 MiB in 1,800 frames; reup-ab1), the write watch flagging
     // pages whose texture bytes did not change. In-race A/B: frame -0.11 / -0.49 ms, busy -0.10 / -0.91 (25/11/2026).
     {"REUP_SAME", "1"},
+    // Large guest memcpy/memset destinations held writable in runs before the copy instead of a write-watch fault per
+    // 64 KiB (nvn_api_core.c guest_write_hold): in-race A/B, two 1.8.0 Grand Prix (hold-ab / hold-inv, 28/11/2026),
+    // 1 % low 37.9 -> 40.5 and 36.5 -> 42.6 fps, 0.1 % low 21.0 -> 20.4 and 15.9 -> 29.2 fps, frame -0.10 ms balanced;
+    // the write-watch fault storms behind the 1 % low's page-protection frames left B's slowest frames.
+    {"MEMCPY_HOLD", "1"},
     // The console's own controller: PlayStation icons rather than auto, which guesses from the pad's labels (Xbox when
     // it reports none), and the DualSense's vibration at 100 % (the table's 130 % suits PC pads; asked for by the user,
     // 24/11/2026). Both stay in Pit Stop > Controls.
