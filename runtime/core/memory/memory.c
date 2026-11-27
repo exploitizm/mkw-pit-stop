@@ -565,6 +565,18 @@ void mem_init(void) {
 #ifdef __PROSPERO__
     if (rt_knob("PS5_FAST_LOCK", "0") == 1)   // (a lock keeps its kind for life, so "ab" cannot work)
         rt_log("platform: fast locks on (MKW_PS5_FAST_LOCK); the %d locks made before this keep the old kind", plat_lock_fast_mode(1));
+    const char *pi_env = cfg_get("MKW_PS5_PRIO_INHERIT");
+    if (pi_env && *pi_env) {
+        char *end = NULL;
+        long pi_val = strtol(pi_env, &end, 10);
+        if (end && !*end && (pi_val == 0 || pi_val == 1 || pi_val == 2)) {
+            if (pi_val > 0)
+                rt_log("platform: priority-inheriting locks mode %ld (MKW_PS5_PRIO_INHERIT); the %d locks made before this keep the old kind",
+                       pi_val, plat_lock_prio_inherit_mode((int)pi_val));
+        } else {
+            rt_log("platform: ignoring invalid MKW_PS5_PRIO_INHERIT='%s' (expected 0, 1 or 2)", pi_env);
+        }
+    }
 #endif
     const char *pool = cfg_get("MKW_APP_POOL");
     uint64_t aslr = low < alias ? low : alias;

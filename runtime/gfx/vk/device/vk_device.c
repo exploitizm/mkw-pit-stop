@@ -352,6 +352,9 @@ typedef struct {
     VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR compute_derivatives;
     VkPhysicalDeviceComputeOccupancyPriorityFeaturesNV occ;
     VkPhysicalDevicePresentWaitFeaturesKHR pwait;
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+    VkPhysicalDeviceDescriptorBufferFeaturesEXT desc_buf;
+#endif
 } FeatureChain;
 
 static int create_device(void) {
@@ -464,6 +467,18 @@ static int create_device(void) {
         ext[n_ext++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
         CHAIN(pexe, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR);
     }
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+    // MKW_DESC_BUFFER=1 (opt-in): VK_EXT_descriptor_buffer writes both vertex and fragment descriptor sets directly
+    // into per-command-buffer mapped memory instead of allocating VkDescriptorSets / calling vkUpdateDescriptorSets.
+    const char *dbe = cfg_get("MKW_DESC_BUFFER");
+    if (dbe && !strcmp(dbe, "1") && has_ext(ep, ne, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME)) {
+        g_vk.has_desc_buf = 1;
+        ext[n_ext++] = VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME;
+        CHAIN(desc_buf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT);
+    } else if (dbe && !strcmp(dbe, "1")) {
+        rt_log("vk: MKW_DESC_BUFFER=1 requested, but device lacks VK_EXT_descriptor_buffer");
+    }
+#endif
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
@@ -539,6 +554,13 @@ static int create_device(void) {
     if (g_vk.has_occupancy && !c->occ.computeOccupancyPriority) g_vk.has_occupancy = 0;
     if (g_vk.has_present_wait && (!c->pwait.presentWait || !g_vk.has_present_id)) g_vk.has_present_wait = 0;
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+    if (g_vk.has_desc_buf && (!c->desc_buf.descriptorBuffer || !g_vk.has_buffer_device_address)) {
+        rt_log("vk: MKW_DESC_BUFFER=1 disabled: descriptorBuffer=%d bufferDeviceAddress=%d",
+               (int)c->desc_buf.descriptorBuffer, g_vk.has_buffer_device_address);
+        g_vk.has_desc_buf = 0;
+    }
+#endif
     g_vk.has_8bit_storage = c->f12.storageBuffer8BitAccess;
     g_vk.has_ssbo_nonuniform = c->f12.shaderStorageBufferArrayNonUniformIndexing && c->f12.descriptorBindingPartiallyBound;
     g_vk.has_placed = has_placed && c->placed.memoryMapPlaced && c->placed.memoryUnmapReserve;
@@ -625,6 +647,34 @@ static int create_device(void) {
         vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
         g_vk.min_imported_host_alignment = (uint32_t)emh.minImportedHostPointerAlignment;
     }
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+    if (g_vk.has_desc_buf) {
+        VkPhysicalDeviceDescriptorBufferPropertiesEXT dbp = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2db = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dbp};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2db);
+        g_vk.db.align = dbp.descriptorBufferOffsetAlignment ? dbp.descriptorBufferOffsetAlignment : 1;
+        g_vk.db.sz_cis = dbp.combinedImageSamplerDescriptorSize;
+        g_vk.db.sz_simg = dbp.sampledImageDescriptorSize;
+        g_vk.db.sz_stimg = dbp.storageImageDescriptorSize;
+        g_vk.db.sz_ubo = dbp.uniformBufferDescriptorSize;
+        g_vk.db.sz_ssbo = dbp.storageBufferDescriptorSize;
+        g_vk.db.sz_utex = dbp.uniformTexelBufferDescriptorSize;
+        g_vk.db.sz_stex = dbp.storageTexelBufferDescriptorSize;
+        g_vk.db.get_layout_size = (PFN_vkGetDescriptorSetLayoutSizeEXT)vkGetDeviceProcAddr(g_vk.device, "vkGetDescriptorSetLayoutSizeEXT");
+        g_vk.db.get_binding_off = (PFN_vkGetDescriptorSetLayoutBindingOffsetEXT)vkGetDeviceProcAddr(g_vk.device, "vkGetDescriptorSetLayoutBindingOffsetEXT");
+        g_vk.db.get_desc = (PFN_vkGetDescriptorEXT)vkGetDeviceProcAddr(g_vk.device, "vkGetDescriptorEXT");
+        g_vk.db.cmd_bind_bufs = (PFN_vkCmdBindDescriptorBuffersEXT)vkGetDeviceProcAddr(g_vk.device, "vkCmdBindDescriptorBuffersEXT");
+        g_vk.db.cmd_set_offs = (PFN_vkCmdSetDescriptorBufferOffsetsEXT)vkGetDeviceProcAddr(g_vk.device, "vkCmdSetDescriptorBufferOffsetsEXT");
+        if (g_vk.db.get_layout_size && g_vk.db.get_binding_off && g_vk.db.get_desc && g_vk.db.cmd_bind_bufs && g_vk.db.cmd_set_offs) {
+            g_vk.use_desc_buf = 1;
+            rt_log("vk: VK_EXT_descriptor_buffer active (MKW_DESC_BUFFER=1, align=%llu ubo=%zu ssbo=%zu cis=%zu)",
+                   (unsigned long long)g_vk.db.align, g_vk.db.sz_ubo, g_vk.db.sz_ssbo, g_vk.db.sz_cis);
+        } else {
+            rt_log("vk: VK_EXT_descriptor_buffer entry points missing, falling back to descriptor sets");
+        }
+    }
+#endif
     vk_caps_init(&g_vk);
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.device, .instance = g_vk.instance,

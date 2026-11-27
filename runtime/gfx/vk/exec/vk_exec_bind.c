@@ -74,6 +74,84 @@ static PlatMutex rs_lock = PLAT_MUTEX_INIT;
 
 // ---- descriptors
 
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+static _Thread_local struct {
+    VkCommandBuffer cb;
+    struct { VkBuffer buf; VkDeviceAddress addr; } e[64];
+} bda_cache;
+
+static VkDeviceAddress bda_of(VkCommandBuffer cb, VkBuffer buf) {
+    if (bda_cache.cb != cb) memset(bda_cache.e, 0, sizeof bda_cache.e), bda_cache.cb = cb;
+    uint32_t idx = (uint32_t)(((uintptr_t)buf >> 4) * 0x9e3779b1u) & 63u;
+    if (bda_cache.e[idx].buf == buf) return bda_cache.e[idx].addr;
+    VkBufferDeviceAddressInfo ai = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = buf};
+    VkDeviceAddress addr = vkGetBufferDeviceAddress(vk_ctx()->device, &ai);
+    bda_cache.e[idx].buf = buf, bda_cache.e[idx].addr = addr;
+    return addr;
+}
+
+static size_t db_desc_size(const VkCtx *vc, VkDescriptorType t) {
+    switch (t) {
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: return vc->db.sz_cis;
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: return vc->db.sz_simg;
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: return vc->db.sz_stimg;
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: return vc->db.sz_ubo;
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: return vc->db.sz_ssbo;
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: return vc->db.sz_utex;
+    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: return vc->db.sz_stex;
+    default: return 0;
+    }
+}
+
+static void db_write_set(VkExec *ex, const VkPipeInfo *info, uint32_t i0, uint32_t i1, const VkDescSlot *ds, uint8_t *dst) {
+    VkCtx *vc = vk_ctx();
+    uint32_t at = 0;
+    for (uint32_t i = i0; i < i1; i++) {
+        const VkPipeBinding *b = &info->bindings[i];
+        uint32_t cnt = b->count ? b->count : 1;
+        size_t stride = db_desc_size(vc, b->type);
+        VkDeviceSize base = info->db_off[i];
+        for (uint32_t k = 0; k < cnt; k++) {
+            const VkDescSlot *o = &ds[at + k];
+            VkDescriptorGetInfoEXT gi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT, .type = b->type};
+            VkDescriptorAddressInfoEXT ai;
+            switch (b->type) {
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: gi.data.pCombinedImageSampler = &o->image; break;
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: gi.data.pSampledImage = &o->image; break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: gi.data.pStorageImage = &o->image; break;
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+                ai = (VkDescriptorAddressInfoEXT){.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+                                                  .address = bda_of(ex->cb, o->buffer.buffer) + o->buffer.offset,
+                                                  .range = o->buffer.range};
+                gi.data.pUniformBuffer = &ai;
+                break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                ai = (VkDescriptorAddressInfoEXT){.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+                                                  .address = bda_of(ex->cb, o->buffer.buffer) + o->buffer.offset,
+                                                  .range = o->buffer.range};
+                gi.data.pStorageBuffer = &ai;
+                break;
+            case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+                ai = (VkDescriptorAddressInfoEXT){.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+                                                  .address = bda_of(ex->cb, Z.zbuf), .range = ZERO_BYTES,
+                                                  .format = VK_FORMAT_R32G32B32A32_SFLOAT};
+                gi.data.pUniformTexelBuffer = &ai;
+                break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+                ai = (VkDescriptorAddressInfoEXT){.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+                                                  .address = bda_of(ex->cb, Z.zbuf), .range = ZERO_BYTES,
+                                                  .format = VK_FORMAT_R32G32B32A32_SFLOAT};
+                gi.data.pStorageTexelBuffer = &ai;
+                break;
+            default: continue;
+            }
+            vc->db.get_desc(vc->device, &gi, stride, dst + base + (VkDeviceSize)k * stride);
+        }
+        at += cnt;
+    }
+}
+#endif
+
 static int nvn_stage_of(int gfx_stage) {
     if (gfx_stage & VK_PIPE_STAGE_NVN) return gfx_stage & 7;   // a task or mesh binding (vk_pipeline.c add_stage)
     return gfx_stage == GFX_STAGE_VS ? NVN_STAGE_VS : gfx_stage == GFX_STAGE_FS ? NVN_STAGE_FS : NVN_STAGE_CS;
@@ -1040,7 +1118,8 @@ void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         B.ds_layout = info->layout;
         B.ds_bound[0] = B.ds_bound[1] = VK_NULL_HANDLE;
         B.ds_pushed[0] = B.ds_pushed[1] = 0;
-        set1_first = n_sets == 2 && vk_ctx()->validation;
+        B.db_bound_addr_set[0] = B.db_bound_addr_set[1] = 0;
+        set1_first = n_sets == 2 && vk_ctx()->validation && !vk_ctx()->use_desc_buf;
     }
     for (uint32_t k = 0; k < n_sets; k++) {
         uint32_t s = set1_first ? 1 - k : k, i0 = lo[s], i1 = hi[s];
@@ -1055,6 +1134,33 @@ void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             }
             continue;
         }
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+        if (vk_ctx()->use_desc_buf) {
+            VkCtx *vc = vk_ctx();
+            VkDescriptorSetLayout sl = s ? info->set_layout1 : info->set_layout;
+            VkDeviceSize off = 0;
+            if (gfx && s < 2 && B.db_bound_addr && B.db_last_layout[s] == sl && DS.n[s] == dbytes &&
+                !memcmp(DS.sig[s], ds, dbytes)) {
+                off = B.db_last_off[s];
+                BS.set_reuse++;
+            } else {
+                uint8_t *dst = db_alloc(ex, info->db_size[s], &off);
+                db_write_set(ex, info, i0, i1, ds, dst);
+                if (gfx && s < 2) {
+                    B.db_last_off[s] = off, B.db_last_layout[s] = sl, DS.n[s] = dbytes;
+                    memcpy(DS.sig[s], ds, dbytes);
+                }
+                BS.set_new++;
+            }
+            if (!gfx || s >= 2 || B.db_bound_addr_set[s] != B.db_bound_addr || B.db_bound_off[s] != off) {
+                uint32_t bidx = 0;
+                rec_set_desc_buf_offsets(vc->db.cmd_set_offs, ex->cb, info->bind_point, info->layout, s, 1, &bidx, &off);
+                if (gfx && s < 2) B.db_bound_addr_set[s] = B.db_bound_addr, B.db_bound_off[s] = off;
+                RS.cmds++;
+            }
+            continue;
+        }
+#endif
         if (vk_pipeline_draw_cache()) {
             dc_bind(ex, info, s, (VkDescSlot *)ds, dbytes / (uint32_t)sizeof *d, w, i0, i1);
             continue;

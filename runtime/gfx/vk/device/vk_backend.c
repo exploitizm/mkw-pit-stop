@@ -822,19 +822,36 @@ static void helpers_place(uint64_t mask) {
 
 static void replay_core(void) {
     static int mode = -1, fmode = 0, smode = 0, applied = 0, placed = 0, c = -1;
+#ifdef __PROSPERO__
+    static int ccx_mode = 0;
+    static uint64_t ccx0, ccx1;
+#endif
     static uint64_t all, own, fast, own_core;
     if (mode < 0) {
         uint64_t first;
         int cores = plat_cpu_cores(&all, &first);
         fast = plat_cpu_fast() & all;
 #ifdef __PROSPERO__
-        mode = rt_knob("REPLAY_CORE", "0");
-        for (int k = 31; k >= 0 && c < 0; k--)
-            if ((all >> (2 * k) & 3) == 3) c = 2 * k;
-        if (mode && cores >= 2 && c >= 0) {
-            own = 1ull << c, own_core = 3ull << c;
-            rt_log("vk: the replay thread alone on processor %d, the others off its core%s (MKW_REPLAY_CORE)", c,
-                   mode == 2 ? " in the B blocks" : "");
+        // MKW_PS5_CCX (default 0; 1 on; "ab" in the B blocks): partition the PS5's two Zen 2 CCXs so the game's
+        // 6 virtual cores stay on CCX-0 (CPUs 0-7, shared L3) and the Vulkan replay, parallel chunk workers, submit
+        // and present threads run on CCX-1 (CPUs 8-12, shared L3) instead of bouncing cache lines across CCXs.
+        ccx_mode = rt_knob("PS5_CCX", "0");
+        ccx0 = all & 0x00ffull;
+        ccx1 = all & 0x1f00ull;
+        if (ccx_mode && ccx0 && ccx1) {
+            mode = 0;
+            rt_log("vk: PS5 CCX partition: game on CCX-0 (%#llx), Vulkan replay/chunks/helpers on CCX-1 (%#llx)%s "
+                   "(MKW_PS5_CCX)", (unsigned long long)ccx0, (unsigned long long)ccx1,
+                   ccx_mode == 2 ? " in the B blocks" : "");
+        } else {
+            ccx_mode = 0;
+            mode = rt_knob("REPLAY_CORE", "0");
+            for (int k = 31; k >= 0 && c < 0; k--)
+                if ((all >> (2 * k) & 3) == 3) c = 2 * k;
+            if (mode && cores >= 2 && c >= 0) {
+                own = 1ull << c, own_core = 3ull << c;
+                rt_log("vk: the replay thread alone on processor %d, the others off its core%s (MKW_REPLAY_CORE)", c,
+                       mode == 2 ? " in the B blocks" : "");
 #else
         mode = rt_knob("REPLAY_CORE", cores >= 6 && __builtin_popcountll(all) > cores ? "1" : "0");
         if (mode && cores >= 2) {
@@ -860,6 +877,9 @@ static void replay_core(void) {
         } else {
             mode = 0;
         }
+#ifdef __PROSPERO__
+        }
+#endif
         if (fast && fast != all) {
             int left = __builtin_popcountll(mode ? fast & ~own_core : fast);
 #if defined(_WIN32) || defined(__PROSPERO__)
@@ -877,6 +897,21 @@ static void replay_core(void) {
                        "default needs %d (MKW_FAST_CORES=1 forces it)", left, FAST_CORES_MIN);
         }
     }
+#ifdef __PROSPERO__
+    if (ccx_mode) {
+        int on = RT_KNOB_ON(ccx_mode);
+        int helpers = !!vk_sync_submit_thread() + !!present_thread + (vk_exec_par_thread_count() << 2);
+        if (on == applied && helpers == placed) return;
+        if (on != applied) {
+            plat_process_affinity(on ? ccx0 : all);
+            plat_thread_affinity(NULL, on ? ccx1 : all);
+        }
+        helpers_place(on ? ccx1 : all);
+        vk_exec_par_affinity(on ? ccx1 : all);
+        applied = on, placed = helpers;
+        return;
+    }
+#endif
     int on = RT_KNOB_ON(mode), fon = fmode ? RT_KNOB_ON(fmode) : 0, son = smode ? RT_KNOB_ON(smode) : 0,
         state = on | fon << 1 | son << 2, helpers = !!vk_sync_submit_thread() + !!present_thread;
     if (state == applied && helpers == placed) return;

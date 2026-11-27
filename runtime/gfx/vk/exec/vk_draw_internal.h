@@ -66,6 +66,11 @@ typedef struct {
     VkDescriptorSet ds_last[2];          // last allocated and written set per set number, contents in DS
     VkDescriptorSetLayout ds_last_layout[2];
     int ds_pushed[2];                    // set number holds the push of DS.psig under ds_layout
+    VkDeviceAddress db_bound_addr;       // VK_EXT_descriptor_buffer: currently bound descriptor buffer address on cb
+    VkDeviceAddress db_bound_addr_set[2];// descriptor buffer address bound for set s under ds_layout
+    VkDeviceSize db_bound_off[2];        // last bound descriptor buffer offset for set s
+    VkDeviceSize db_last_off[2];         // last written descriptor buffer offset for set s (contents in DS.sig[s])
+    VkDescriptorSetLayout db_last_layout[2];
     int res_valid;                       // the graphics sets bound hold what the inputs in RS give (bind_resources)
 } DrawB;
 #define dtl_b (*(DrawB **)&vk_rt.b)   // vk_exec_draw.c (vk_exec.h VkRecTls)
@@ -209,6 +214,9 @@ uint32_t vk_exec_streams(const VkExec *ex, const VkPipeInfo *info);   // the ver
 void feedback_barrier(VkExec *ex);
 void feedback_written(VkExec *ex, const VkPipeState *s);
 void vk_exec_cb_shutdown(void);
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+uint8_t *db_alloc(VkExec *ex, VkDeviceSize size, VkDeviceSize *off);
+#endif
 // vk_exec_view.c
 void dummies_init(void);
 void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate, VkDescriptorImageInfo *out,

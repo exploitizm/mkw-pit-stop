@@ -21,6 +21,7 @@ VkBufferUsageFlags pool_usage(const VkCtx *c) {
     if (c->has_transform_feedback)
         u |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
     if (c->has_conditional_rendering) u |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+    if (c->use_desc_buf) u |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     return u;
 }
 
@@ -69,7 +70,10 @@ static int placed_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     }
     if (!why) {
         VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .buffer = buf};
-        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &ded, .allocationSize = n,
+        VkMemoryAllocateFlagsInfo afi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .pNext = &ded,
+                                         .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                   .pNext = c->use_desc_buf ? (void *)&afi : (void *)&ded, .allocationSize = n,
                                    .memoryTypeIndex = (uint32_t)type};
         if (vkAllocateMemory(c->device, &ai, NULL, &mem) != VK_SUCCESS) why = "no memory";
         else if (vkBindBufferMemory(c->device, buf, mem, 0) != VK_SUCCESS) why = "bind failed";
@@ -264,7 +268,10 @@ static int import_host(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     VkImportMemoryHostPointerInfoEXT im = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
                                            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                            .pHostPointer = (void *)(uintptr_t)r->import_lo};
-    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &im, .allocationSize = n,
+    VkMemoryAllocateFlagsInfo afi = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .pNext = &im,
+                                     .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                               .pNext = c->use_desc_buf ? (void *)&afi : (void *)&im, .allocationSize = n,
                                .memoryTypeIndex = (uint32_t)type};
     if ((res = import_refused() ? VK_ERROR_INVALID_EXTERNAL_HANDLE : vkAllocateMemory(c->device, &ai, NULL, &r->mem)) != VK_SUCCESS ||
         (res = vkBindBufferMemory(c->device, r->buf, r->mem, 0)) != VK_SUCCESS) {

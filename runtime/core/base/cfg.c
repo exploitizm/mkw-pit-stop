@@ -387,6 +387,10 @@ static const CfgRow rows[] = {
     K("PROFILE_RENDER"),
     K("PROFILE_US"),
     K("PS5_FAST_LOCK"),
+    K("PS5_CCX"),
+    K("PS5_PRIO_INHERIT"),
+    K("PRESENT_COPY"),
+    K("DESC_BUFFER"),
     K("PS5_OVERLAP"),
     K("PS5_PW_BATCH"),
     K("PS5_TSC_CLOCK"),
@@ -659,6 +663,11 @@ static const struct { const char *key, *value; } PS5[] = {
     // The parallel replay as before the 0.1.13 merge (18/11/2026, one player at MKW_FPS=60): the serial head records
     // ~600 draws a frame on the replay thread alone, 5.8-6.3 ms on these cores (reg-1p60: race median 25.9 against
     // 25.1 ms without); the slots checked by chunk and the replay thread recording after its walk (vk_exec_par.c).
+    // Partition Zen 2's two CCXs (vk_backend.c replay_core): game threads on CCX-0 (CPUs 0-7, shared L3), Vulkan
+    // replay, parallel chunk workers, submit and present threads on CCX-1 (CPUs 8-12, shared L3). In-race A/B on base
+    // PS5 (ccx-ab-live, 28/11/2026, 150 A vs 150 B windows, 1.8.0 GP 1080p): frame 17.61 -> 17.06 ms (-0.55 ms,
+    // median 16.95 -> 16.69 ms), busy 16.45 -> 13.63 ms (-2.82 ms), replay 12.29 -> 10.27 ms (-2.02 ms).
+    {"PS5_CCX", "1"},
     {"REPLAY_PAR_HEAD", "0"},
     {"REPLAY_PAR_CHECK_BY_CHUNK", "1"},
     {"REPLAY_PAR_JOIN", "1"},

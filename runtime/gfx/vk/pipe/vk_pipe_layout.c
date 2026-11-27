@@ -165,7 +165,7 @@ static int64_t bindings_sort(Bindings *B, uint64_t *h) {
 // MKW_DRAW_CACHE: a layout's uniform buffers become dynamic when the pipeline layout holds no more than the device
 // allows (n_other: those of the layout's other set); over it the layout keeps them static and its sets miss the cache.
 static void dyn_ubos(Bindings *B, uint32_t n_other) {
-    if (!P.draw_cache) return;
+    if (!P.draw_cache || vk_ctx()->use_desc_buf) return;
     uint32_t n = n_other;
     for (uint32_t i = 0; i < B->n; i++)
         if (B->b[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) n += B->b[i].descriptorCount;
@@ -185,6 +185,27 @@ static uint32_t ubo_count(const Bindings *B) {
     return n;
 }
 
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+static void db_layout_query(Layout *l, uint32_t n0, uint32_t n) {
+    VkCtx *c = vk_ctx();
+    if (!c->use_desc_buf) return;
+    VkDeviceSize al = c->db.align;
+    l->db_off = calloc(n ? n : 1, sizeof *l->db_off);
+    if (!l->db_off) rt_fatal("vk_pipeline: out of memory (db_off)");
+    VkDeviceSize s0 = 0, s1 = 0;
+    c->db.get_layout_size(P.device, l->set, &s0);
+    l->db_size[0] = (s0 + al - 1) & ~(al - 1);
+    for (uint32_t i = 0; i < n0; i++)
+        c->db.get_binding_off(P.device, l->set, l->b[i].binding, &l->db_off[i]);
+    if (l->set1) {
+        c->db.get_layout_size(P.device, l->set1, &s1);
+        l->db_size[1] = (s1 + al - 1) & ~(al - 1);
+        for (uint32_t i = n0; i < n; i++)
+            c->db.get_binding_off(P.device, l->set1, l->b[i].binding, &l->db_off[i]);
+    }
+}
+#endif
+
 Layout *layout_get(Bindings *B) {
     dyn_ubos(B, 0);
     uint64_t h = FNV0;
@@ -198,10 +219,14 @@ Layout *layout_get(Bindings *B) {
     if (!l) return NULL;
     l->hash = h, l->n = B->n, l->pc_stages = B->pc_stages;
     memcpy(l->b, B->b, B->n * sizeof *B->b);
-    l->push = !P.draw_cache && total <= (int64_t)P.max_push;
+    int use_db = vk_ctx()->use_desc_buf;
+    l->push = !use_db && !P.draw_cache && total <= (int64_t)P.max_push;
+    VkDescriptorSetLayoutCreateFlags slf = l->push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0;
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+    if (use_db) slf |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+#endif
     VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-                                          .flags = l->push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0,
-                                          .bindingCount = l->n, .pBindings = l->b};
+                                          .flags = slf, .bindingCount = l->n, .pBindings = l->b};
     if (vkCreateDescriptorSetLayout(P.device, &si, NULL, &l->set) != VK_SUCCESS) {
         free(l);
         return NULL;
@@ -215,7 +240,10 @@ Layout *layout_get(Bindings *B) {
         free(l);
         return NULL;
     }
-    l->tpl[0] = make_tpl(l->b, l->n, l->set, l->push, l->layout, 0);
+    if (!use_db) l->tpl[0] = make_tpl(l->b, l->n, l->set, l->push, l->layout, 0);
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+    db_layout_query(l, l->n, l->n);
+#endif
     l->next = *head;
     *head = l;
     P.stats.layouts++;
@@ -248,14 +276,18 @@ Layout *layout_pair(Bindings *B, Bindings *F) {
     if (!l) return NULL;
     l->hash = h, l->n = n, l->n0 = n0;
     memcpy(l->b, B->b, n * sizeof *B->b);
-    l->push = !P.draw_cache && P.push_stage == GFX_STAGE_VS && tv <= (int64_t)P.max_push;
-    l->push1 = !P.draw_cache && P.push_stage == GFX_STAGE_FS && F->n && tf <= (int64_t)P.max_push;
+    int use_db = vk_ctx()->use_desc_buf;
+    l->push = !use_db && !P.draw_cache && P.push_stage == GFX_STAGE_VS && tv <= (int64_t)P.max_push;
+    l->push1 = !use_db && !P.draw_cache && P.push_stage == GFX_STAGE_FS && F->n && tf <= (int64_t)P.max_push;
+    VkDescriptorSetLayoutCreateFlags f0 = l->push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0;
+    VkDescriptorSetLayoutCreateFlags f1 = l->push1 ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0;
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+    if (use_db) f0 |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT, f1 |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+#endif
     VkDescriptorSetLayoutCreateInfo s0 = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-                                          .flags = l->push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0,
-                                          .bindingCount = n0, .pBindings = l->b};
+                                          .flags = f0, .bindingCount = n0, .pBindings = l->b};
     VkDescriptorSetLayoutCreateInfo s1 = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-                                          .flags = l->push1 ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0,
-                                          .bindingCount = n - n0, .pBindings = l->b + n0};
+                                          .flags = f1, .bindingCount = n - n0, .pBindings = l->b + n0};
     if (vkCreateDescriptorSetLayout(P.device, &s0, NULL, &l->set) != VK_SUCCESS) {
         free(l);
         return NULL;
@@ -275,8 +307,13 @@ Layout *layout_pair(Bindings *B, Bindings *F) {
         free(l);
         return NULL;
     }
-    l->tpl[0] = make_tpl(l->b, n0, l->set, l->push, l->layout, 0);
-    l->tpl[1] = make_tpl(l->b + n0, n - n0, l->set1, l->push1, l->layout, 1);
+    if (!use_db) {
+        l->tpl[0] = make_tpl(l->b, n0, l->set, l->push, l->layout, 0);
+        l->tpl[1] = make_tpl(l->b + n0, n - n0, l->set1, l->push1, l->layout, 1);
+    }
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+    db_layout_query(l, n0, n);
+#endif
     l->next = *head;
     *head = l;
     P.stats.layouts++;

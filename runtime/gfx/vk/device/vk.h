@@ -90,6 +90,19 @@ typedef struct VkCtx {
     uint32_t low_latency2_spec;             // VK_NV_low_latency2's revision when enabled (Reflex, vk_reflex_frame.c), else 0
     int low_latency2_have;                  // the device has VK_NV_low_latency2 (enabled only with MKW_REFLEX at start)
     int device_index;                       // index in vkEnumeratePhysicalDevices
+    int has_desc_buf;                       // VK_EXT_descriptor_buffer advertised and feature enabled
+    int use_desc_buf;                       // MKW_DESC_BUFFER=1 active (all function pointers and properties loaded)
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+    struct {
+        VkDeviceSize align;                 // descriptorBufferOffsetAlignment
+        size_t sz_cis, sz_simg, sz_stimg, sz_ubo, sz_ssbo, sz_utex, sz_stex;
+        PFN_vkGetDescriptorSetLayoutSizeEXT get_layout_size;
+        PFN_vkGetDescriptorSetLayoutBindingOffsetEXT get_binding_off;
+        PFN_vkGetDescriptorEXT get_desc;
+        PFN_vkCmdBindDescriptorBuffersEXT cmd_bind_bufs;
+        PFN_vkCmdSetDescriptorBufferOffsetsEXT cmd_set_offs;
+    } db;
+#endif
 } VkCtx;
 enum { VK_FEEDBACK_OFF, VK_FEEDBACK_RESTART, VK_FEEDBACK_LAYOUT };
 
@@ -892,6 +905,10 @@ typedef struct {
     // Descriptor update template per set (vk_pipeline.c make_tpl): reads one VkDescSlot per descriptor, in binding order,
     // from the start of the set's descriptors. VK_NULL_HANDLE: the set is written with VkWriteDescriptorSet structs.
     VkDescriptorUpdateTemplate tpl[2];
+    // VK_EXT_descriptor_buffer (MKW_DESC_BUFFER=1): byte size of each set in a descriptor buffer, and byte offset of
+    // each binding i in bindings[0..n_bindings) within its set.
+    VkDeviceSize db_size[2];
+    const VkDeviceSize *db_off;
 } VkPipeInfo;
 // One descriptor of the packed array a descriptor update template reads (VkPipeInfo.tpl), 24 bytes for every type; the
 // bytes a type leaves unused are zero, so equal descriptors compare equal byte for byte.

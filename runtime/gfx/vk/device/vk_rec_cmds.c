@@ -190,6 +190,32 @@ void rec_update_tpl(PFN_vkUpdateDescriptorSetWithTemplate fn, VkCommandBuffer cb
     pub();
 }
 
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+void rec_bind_desc_bufs(PFN_vkCmdBindDescriptorBuffersEXT fn, VkCommandBuffer cb, uint32_t n,
+                        const VkDescriptorBufferBindingInfoEXT *infos) {
+    if (!OWNED(cb)) { fn(cb, n, infos); return; }
+    size_t sz = sizeof *infos * n;
+    A_BindDescBufs *a = put(R_BindDescBufs, sizeof *a + A8(sz));
+    uint8_t *at = (uint8_t *)(a + 1);
+    *a = (A_BindDescBufs){fn, n, NULL};
+    a->infos = tail_copy(&at, infos, sz);
+    pub();
+}
+
+void rec_set_desc_buf_offsets(PFN_vkCmdSetDescriptorBufferOffsetsEXT fn, VkCommandBuffer cb, VkPipelineBindPoint bp,
+                              VkPipelineLayout layout, uint32_t first, uint32_t n, const uint32_t *idx,
+                              const VkDeviceSize *offs) {
+    if (!OWNED(cb)) { fn(cb, bp, layout, first, n, idx, offs); return; }
+    size_t si = sizeof *idx * n, so = sizeof *offs * n;
+    A_SetDescBufOffs *a = put(R_SetDescBufOffs, sizeof *a + A8(si) + A8(so));
+    uint8_t *at = (uint8_t *)(a + 1);
+    *a = (A_SetDescBufOffs){fn, bp, layout, first, n, NULL, NULL};
+    a->idx = tail_copy(&at, idx, si);
+    a->offs = tail_copy(&at, offs, so);
+    pub();
+}
+#endif
+
 void rec_push(PFN_vkCmdPushDescriptorSetKHR fn, VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout,
               uint32_t set, uint32_t n, const VkWriteDescriptorSet *w) {
     if (vk_guard_on()) vk_guard_pushed(cb, bp, set);
