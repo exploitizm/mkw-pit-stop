@@ -245,6 +245,7 @@ void mem_early_wait(uint64_t fence) {
     }
     __atomic_add_fetch(&waits, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&wait_ns, (int64_t)ns, __ATOMIC_RELAXED);
+    perf_ledger(PERF_LG_EARLY, ns);
     plat_mutex_lock(&wread_lock);   // after a wait of milliseconds: the lock costs nothing beside it
     int j = 0;
     while (j < WREAD_N && wread[j].n && wread[j].pc != wq.pc) j++;

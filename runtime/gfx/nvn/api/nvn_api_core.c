@@ -637,6 +637,7 @@ static void sync_wait_note(uint64_t fence, uint64_t ns, uint64_t issued_at_start
     static uint64_t n[4], t[4], total;
     int k = nvn_fence_frame_rel(fence);
     __atomic_fetch_add(&n[k], 1, __ATOMIC_RELAXED), __atomic_fetch_add(&t[k], ns, __ATOMIC_RELAXED);
+    perf_ledger(fence > issued_at_start ? PERF_LG_SYNC_REPLAY : PERF_LG_SYNC_GPU, ns);
     if (fence > issued_at_start) __atomic_fetch_add(&sw_rep_n, 1, __ATOMIC_RELAXED), __atomic_fetch_add(&sw_rep_ns, ns, __ATOMIC_RELAXED);
     else __atomic_fetch_add(&sw_gpu_n, 1, __ATOMIC_RELAXED), __atomic_fetch_add(&sw_gpu_ns, ns, __ATOMIC_RELAXED);
     if (__atomic_add_fetch(&total, 1, __ATOMIC_RELAXED) % 600) return;

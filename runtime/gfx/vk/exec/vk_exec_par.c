@@ -265,7 +265,9 @@ static void precheck(void) {
     vk_astc_batch_end();
     vk_texture_unlock();
     P.pre_from = P.ntid;
-    P.pre_ns += kern_now_ns() - t0;
+    uint64_t pre_dt = kern_now_ns() - t0;
+    P.pre_ns += pre_dt;
+    perf_ledger(PERF_LG_PRECHECK, pre_dt);
     P.pre_snap_ns += vk_pc_snap_ns - s0, P.pre_up_n += vk_pc_up_n - u0, P.pre_up_ns += vk_pc_up_ns - un0;
     P.pre_q_ns += vk_snap_q_ns - q0, P.pre_lock_ns += vk_snap_lock_ns - l0;
 }

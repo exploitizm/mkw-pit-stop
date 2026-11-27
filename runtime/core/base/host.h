@@ -50,6 +50,13 @@ void perf_main_thread(void);                    // the calling thread is the gue
 enum { PERF_CNT_PIPE_ASYNC, PERF_CNT_PIPE_SKIP, PERF_CNT_TEX_UP, PERF_CNT_TEX_REUP, PERF_CNT_PIPE_WAIT, PERF_CNT_ONESHOT_WAIT, PERF_CNT_PIPE_BUILT, PERF_CNT_TEX_NEW, PERF_CNT_TEX_ALIAS,
        PERF_CNT_WB, PERF_CNT_WB_SKIP, PERF_CNT_N };
 void perf_count(int kind);
+// Per-frame cost ledger (MKW_TRACE=perf): time any thread spent in each of these since the last present, printed on
+// the "perf: slow frame" line so tools/run/slowframes.py can tell what a slow frame was made of (the 60-frame lines
+// only give window totals). Names in perf.c ledger_name. Page protection and PACK unpacks come from the platform
+// (plat_mem_cost_ns), the replay from perf_replay.
+enum { PERF_LG_SYNC_REPLAY, PERF_LG_SYNC_GPU, PERF_LG_TEXLOCK, PERF_LG_UPLOAD, PERF_LG_ASTC, PERF_LG_PRECHECK,
+       PERF_LG_EARLY, PERF_LG_GOV, PERF_LG_CAPTURE, PERF_LG_SPARSE, PERF_LG_N };
+void perf_ledger(int kind, uint64_t ns);
 void perf_present(uint64_t frame);
 void perf_summary_flush(void);                  // prints the frame-time summary of the running period (exit); the 60 s lines come from perf_present
 void gfx_exit_log(void);                        // back end's lines for the exit summary (weak no-op in prof_win.c)

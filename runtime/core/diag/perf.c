@@ -111,6 +111,53 @@ void perf_replay(uint64_t t0) {
     if (__atomic_load_n(&perf_on, __ATOMIC_RELAXED)) plat_add64(&replay_ns, d);
 }
 
+// The per-frame cost ledger (host.h), read and reset at each present. A cost is charged to the present that follows
+// it: with the game a frame ahead of the replay, a slow frame's ledger holds the game's next frame and the replay of
+// its own, which is what ran in its period.
+static volatile int64_t ledger[PERF_LG_N];
+static const char *const ledger_name[PERF_LG_N] = {"sync_replay", "sync_gpu", "texlock", "upload", "astc",
+                                                   "precheck",    "early",    "gov",     "capture", "sparse"};
+
+void perf_ledger(int kind, uint64_t ns) {
+    if (ns && __atomic_load_n(&perf_on, __ATOMIC_RELAXED)) plat_add64(&ledger[kind], (int64_t)ns);
+}
+
+// The ledger since the last present, with the replay's time (rep_ns) and the platform's page protection and PACK
+// unpacks (running totals, differenced here), into out as " name ms" pairs (under 0.05 ms left out); resets it and adds
+// it to the window's sums, which ledger_window prints every 60 presents as the normal frame's costs.
+enum { LG_REPLAY = PERF_LG_N, LG_PROT, LG_UNPACK, LG_ALL };
+static uint64_t lg_win[LG_ALL];
+
+static void ledger_fmt(char *out, size_t cap, const uint64_t *ns, double div) {
+    static const char *const extra[LG_ALL - PERF_LG_N] = {"replay", "prot", "unpack"};
+    size_t o = 0;
+    out[0] = 0;
+    for (int i = 0; i < LG_ALL && o < cap; i++) {
+        double ms = (double)ns[i] / 1e6 / div;
+        if (ms >= 0.05) o += (size_t)snprintf(out + o, cap - o, " %s %.2f", i < PERF_LG_N ? ledger_name[i] : extra[i - PERF_LG_N], ms);
+    }
+}
+
+static void ledger_take(char *out, size_t cap, uint64_t rep_ns) {
+    static uint64_t plat_prev[PLAT_MEM_COST_N];
+    uint64_t pc[PLAT_MEM_COST_N] = {0}, ns[LG_ALL];
+    plat_mem_cost_ns(pc);
+    for (int i = 0; i < PERF_LG_N; i++) ns[i] = (uint64_t)plat_xchg64(&ledger[i], 0);
+    ns[LG_REPLAY] = rep_ns;
+    ns[LG_PROT] = pc[PLAT_MEM_COST_PROT] - plat_prev[PLAT_MEM_COST_PROT];
+    ns[LG_UNPACK] = pc[PLAT_MEM_COST_UNPACK] - plat_prev[PLAT_MEM_COST_UNPACK];
+    memcpy(plat_prev, pc, sizeof pc);
+    for (int i = 0; i < LG_ALL; i++) lg_win[i] += ns[i];
+    ledger_fmt(out, cap, ns, 1);
+}
+
+static void ledger_window(uint64_t frame, uint64_t n) {
+    char b[384];
+    ledger_fmt(b, sizeof b, lg_win, (double)n);
+    rt_log("perf: frame %llu: costs ms/f:%s", (unsigned long long)frame, b);
+    memset(lg_win, 0, sizeof lg_win);
+}
+
 static volatile int64_t counts[PERF_CNT_N];   // running totals: the perf log and the flight recorder take differences
 
 void perf_count(int kind) {
@@ -521,15 +568,18 @@ void perf_present(uint64_t frame) {
         const char *e = cfg_get("MKW_PERF_SLOW_MS");
         slow_ns = (uint64_t)(e && atoi(e) > 0 ? atoi(e) : 50) * 1000000ull;
     }
+    char costs[384];
+    ledger_take(costs, sizeof costs, rep);   // every present, so a slow frame's ledger is its own period's
     if (last) {
         sum += d;
         n++;
         if (d > max) max = d, memcpy(worst_ns, frame_ns, sizeof worst_ns);
         if (d >= slow_ns)
-            rt_log("perf: slow frame %llu: %.1f ms; blocked pipeline %.1f texture %.1f astc %.1f fence %.1f pacing %.1f",
+            rt_log("perf: slow frame %llu: %.1f ms; blocked pipeline %.1f texture %.1f astc %.1f fence %.1f pacing %.1f; "
+                   "costs ms:%s",
                    (unsigned long long)frame, d / 1e6, frame_ns[PERF_PIPE] / 1e6,
                    frame_ns[PERF_TEX] / 1e6, frame_ns[PERF_ASTC] / 1e6, frame_ns[PERF_FENCE] / 1e6,
-                   frame_ns[PERF_PACE] / 1e6);
+                   frame_ns[PERF_PACE] / 1e6, costs);
     }
     memset(frame_ns, 0, sizeof frame_ns);
     last = now;
@@ -563,6 +613,7 @@ void perf_present(uint64_t frame) {
                (span > wait_ns[PERF_PACE] ? span - wait_ns[PERF_PACE] : 0) / 1e6 / n,
                plat_xchg64(&replay_ns, 0) / 1e6 / n, (unsigned long long)ab_b, (unsigned long long)n, frame_step_world_us() / 1e6);
     if (n && span) perf_gpu_line(frame, sum / 1e6 / n, (double)wait_ns[PERF_PACE] / span, n);
+    if (n) ledger_window(frame, n);
     // MKW_LOCK_PROF=1: the waits per lock in this window (vk_sync.c's line needs 1,200 submissions; the boot has fewer),
     // and who held a lock while another thread waited on it
     if (n && span) {

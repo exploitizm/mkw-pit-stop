@@ -162,6 +162,7 @@ static inline void lock(void) {
     if (!tex_spin()) plat_rmutex_lock(&tex_lock);
     uint64_t dt = plat_now_ns() - t0;
     tl_n++, tl_ns += dt;
+    perf_ledger(PERF_LG_TEXLOCK, dt);
     if (dt > tl_max) tl_max = dt;
 }
 static inline void unlock(void) { plat_rmutex_unlock(&tex_lock); }

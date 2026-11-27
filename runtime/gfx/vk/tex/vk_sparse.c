@@ -1256,6 +1256,7 @@ VkSparseOrder vk_sparse_order(uint64_t fence, int binds) {
         hang_mark(prev);
         if (r == VK_SUCCESS && on_) vk_sparse_order_submitted(sig);
         uint64_t dt = plat_now_ns() - t0;
+        perf_ledger(PERF_LG_SPARSE, dt);
         if (r != VK_SUCCESS || dt > 100000000ull)
             rt_log("vk: sparse bind %d blocks in %d images took %.1f ms (VkResult=%d)", blocks, ni, dt / 1e6, (int)r);
         if (r != VK_SUCCESS) {

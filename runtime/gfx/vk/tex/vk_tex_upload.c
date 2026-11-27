@@ -535,6 +535,7 @@ static int upload_bands(Tex *e, uint32_t partial_since, int bw, int bh, int bpb,
         }
     }
     n_reuploads++, perf_count(PERF_CNT_TEX_REUP);
+    perf_ledger(PERF_LG_UPLOAD, dt);
     ru_n++, ru_bytes += up_bytes, ru_ns += dt;
     uint64_t full_raw = (uint64_t)rb * rows;
     if (full_raw > up_bytes) ru_skip_sub += nb - nd, ru_skip_bytes += full_raw - up_bytes;
@@ -821,6 +822,7 @@ static int upload(Tex *e, uint32_t partial_since) {
 counted:;
 #undef UP_PHASE
     uint64_t dt = kern_now_ns() - u0;
+    perf_ledger(PERF_LG_UPLOAD, dt);
     if (rt_trace & RT_TRACE_PERF) {
         up_ph_n++;
         for (int i = 0; i < UPH_N; i++) up_ph_ns[i] += ph[i];

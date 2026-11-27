@@ -348,6 +348,7 @@ static size_t packed_units[3];
 static uint64_t pk_packed_bytes, pk_store_bytes, pk_ever;
 // Since the last plat_mem_pack_summary (exchanged there).
 static uint64_t pk_unpacks, pk_unpack_ns, pk_unpack_max_ns, pk_unpack_cause[PLAT_BACK_N];
+static uint64_t pk_unpack_total_ns;   // never reset: plat_mem_cost_ns
 static uint64_t pk_verify_checked, pk_verify_bad, pk_verify_addr, pk_fill_bad;
 static struct { uint32_t tid; uint64_t n; char name[24]; } pk_thr[PK_THREADS];   // unpacks by thread
 static uint32_t (*g_frozen_ms_hook)(uint64_t addr);
@@ -393,6 +394,7 @@ static void pk_unpacked(PackBlob *b, RangeKind kind, int cause, uint64_t ns) {
     __atomic_sub_fetch(&pk_packed_bytes, b->csize, __ATOMIC_RELAXED);
     __atomic_add_fetch(&pk_unpacks, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&pk_unpack_ns, ns, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&pk_unpack_total_ns, ns, __ATOMIC_RELAXED);
     uint64_t m = __atomic_load_n(&pk_unpack_max_ns, __ATOMIC_RELAXED);
     while (ns > m && !__atomic_compare_exchange_n(&pk_unpack_max_ns, &m, ns, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
     if ((unsigned)cause < PLAT_BACK_N) __atomic_add_fetch(&pk_unpack_cause[cause], 1, __ATOMIC_RELAXED);
@@ -513,8 +515,10 @@ static Ps5MixedBlock *find_unit_lockfree(const VmRange *range, uint64_t address)
 // perf.c logs the table every 600 frames (plat_mem_protect_stats).
 #define PSTAT_N 64
 static struct { uintptr_t ra; uint64_t n, ns; } pstat[PSTAT_N];
+static uint64_t pstat_total_ns;   // never reset: plat_mem_cost_ns
 
 static void pstat_add(uintptr_t ra, uint64_t ns) {
+    __atomic_add_fetch(&pstat_total_ns, ns, __ATOMIC_RELAXED);
     for (uint32_t i = (uint32_t)((ra >> 4) * 0x9e3779b1u) % PSTAT_N, k = 0; k < PSTAT_N; k++, i = (i + 1) % PSTAT_N) {
         uintptr_t cur = __atomic_load_n(&pstat[i].ra, __ATOMIC_ACQUIRE);
         if (!cur) {
@@ -528,6 +532,11 @@ static void pstat_add(uintptr_t ra, uint64_t ns) {
             return;
         }
     }
+}
+
+void plat_mem_cost_ns(uint64_t out[PLAT_MEM_COST_N]) {
+    out[PLAT_MEM_COST_PROT] = __atomic_load_n(&pstat_total_ns, __ATOMIC_RELAXED);
+    out[PLAT_MEM_COST_UNPACK] = __atomic_load_n(&pk_unpack_total_ns, __ATOMIC_RELAXED);
 }
 
 void plat_mem_protect_stats(void (*emit)(uintptr_t ra, uint64_t n, uint64_t ns, void *ctx), void *ctx) {
