@@ -24,7 +24,7 @@ from pathlib import Path
 TICK = 1000 / 60  # ms of a 60 fps frame
 SLOW = re.compile(r"perf: slow frame (\d+): ([\d.]+) ms; blocked (.*?)(?:; costs ms:(.*?))?(?:; ab=([AB]))?$")
 ABWIN = re.compile(r"interval avg .*; ab (\d+)/(\d+);")  # the 60-frame perf line: B frames of the window
-WINDOW = re.compile(r"perf: frame (\d+): costs ms/f:(.*)$")
+WINDOW = re.compile(r"perf: frame (\d+): costs ms/f:(.*?)(?:;.*)?$")
 TRACE = re.compile(r"frame: period ([\d.]+) call [\d.]+ meas [\d.]+ cpu ([\d.]+) ts (-?[\d.]+)")
 RESULT = re.compile(
     r"bench: result mode=(\w+) avg_ms=([\d.]+) fps=([\d.]+) low1=([\d.]+) low01=([\d.]+) worst_ms=([\d.]+) frames=(\d+)"
