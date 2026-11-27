@@ -515,10 +515,11 @@ static Ps5MixedBlock *find_unit_lockfree(const VmRange *range, uint64_t address)
 // perf.c logs the table every 600 frames (plat_mem_protect_stats).
 #define PSTAT_N 64
 static struct { uintptr_t ra; uint64_t n, ns; } pstat[PSTAT_N];
-static uint64_t pstat_total_ns;   // never reset: plat_mem_cost_ns
+static uint64_t pstat_kind_ns[PLAT_MEM_COST_N];   // never reset: plat_mem_cost_ns (by PLAT_MEM_COST_PROT_* kind)
 
-static void pstat_add(uintptr_t ra, uint64_t ns) {
-    __atomic_add_fetch(&pstat_total_ns, ns, __ATOMIC_RELAXED);
+static void pstat_add(uintptr_t ra, uint64_t ns, int kind) {
+    __atomic_add_fetch(&pstat_kind_ns[kind], ns, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&pstat_kind_ns[PLAT_MEM_COST_PROT_CALLS], 1, __ATOMIC_RELAXED);
     for (uint32_t i = (uint32_t)((ra >> 4) * 0x9e3779b1u) % PSTAT_N, k = 0; k < PSTAT_N; k++, i = (i + 1) % PSTAT_N) {
         uintptr_t cur = __atomic_load_n(&pstat[i].ra, __ATOMIC_ACQUIRE);
         if (!cur) {
@@ -535,7 +536,7 @@ static void pstat_add(uintptr_t ra, uint64_t ns) {
 }
 
 void plat_mem_cost_ns(uint64_t out[PLAT_MEM_COST_N]) {
-    out[PLAT_MEM_COST_PROT] = __atomic_load_n(&pstat_total_ns, __ATOMIC_RELAXED);
+    for (int i = 0; i < PLAT_MEM_COST_N; i++) out[i] = __atomic_load_n(&pstat_kind_ns[i], __ATOMIC_RELAXED);
     out[PLAT_MEM_COST_UNPACK] = __atomic_load_n(&pk_unpack_total_ns, __ATOMIC_RELAXED);
 }
 
@@ -554,7 +555,8 @@ static int ps5_pw_protect(uint64_t addr, size_t size, int rw) {
     if (prot_watch_has_gpu(addr, size)) prot |= PS5_KERNEL_PROT_GPU_READ | PS5_KERNEL_PROT_GPU_WRITE;
     uint64_t t0 = plat_now_ns();
     int ok = sceKernelMprotect((void *)(uintptr_t)addr, size, prot) == 0;
-    pstat_add(rw == 3 ? 3 : rw ? 1 : 2, plat_now_ns() - t0);   // 3: a hold's unprotect (prot_watch_hold)
+    pstat_add(rw == 3 ? 3 : rw ? 1 : 2, plat_now_ns() - t0,   // 3: a hold's unprotect (prot_watch_hold)
+              rw == 3 ? PLAT_MEM_COST_PROT_HOLD : rw ? PLAT_MEM_COST_PROT_FAULT : PLAT_MEM_COST_PROT_ARM);
     return ok;
 }
 
@@ -978,7 +980,7 @@ __attribute__((noinline)) int plat_mem_protect(uint64_t address, uint64_t bytes,
     uint64_t t0 = plat_now_ns();
     int ok = protection >= PLAT_PROT_NONE && protection <= PLAT_PROT_RW &&
              change_locked(address, bytes, PROTECT, protection);
-    pstat_add((uintptr_t)__builtin_return_address(0), plat_now_ns() - t0);
+    pstat_add((uintptr_t)__builtin_return_address(0), plat_now_ns() - t0, PLAT_MEM_COST_PROT_CHANGE);
     return ok;
 }
 
@@ -1132,7 +1134,7 @@ __attribute__((noinline)) PlatEarlyResult plat_mem_early_protect(uint64_t addr, 
     if (count > EARLY_GEN_N) first = 0, count = EARLY_GEN_N;
     for (uint64_t i = 0; i < count; i++)
         __atomic_add_fetch(&early_gen[(first + i) % EARLY_GEN_N], 1, __ATOMIC_RELEASE);
-    pstat_add((uintptr_t)__builtin_return_address(0), plat_now_ns() - t0);
+    pstat_add((uintptr_t)__builtin_return_address(0), plat_now_ns() - t0, PLAT_MEM_COST_PROT_EARLY);
     return r;
 }
 
@@ -1149,7 +1151,7 @@ __attribute__((noinline)) int plat_mem_early_open_read(uint64_t addr, size_t n) 
         ok = sceKernelMprotect((void *)(uintptr_t)addr, n, prot) == 0;
     }
     unit_unlock(u);
-    pstat_add((uintptr_t)__builtin_return_address(0), plat_now_ns() - t0);
+    pstat_add((uintptr_t)__builtin_return_address(0), plat_now_ns() - t0, PLAT_MEM_COST_PROT_EARLY);
     return ok;
 }
 

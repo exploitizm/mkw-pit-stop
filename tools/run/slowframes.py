@@ -60,7 +60,8 @@ def classify(
 ):
     """The cause of one slow frame: the cost that grew the most over its normal, followed down to the part that holds
     at least half of that growth. Under a quarter of the frame's excess explained: the game's own CPU or the GPU."""
-    extra = {k: v - base.get(k, 0.0) for k, v in costs.items()}
+    # (prot_calls is a count, not a cost)
+    extra = {k: v - base.get(k, 0.0) for k, v in costs.items() if not k.endswith("_calls")}
     extra.update({f"render {k}": v for k, v in blocked.items() if k in BLOCKED})
     if extra:
         name = max(extra, key=lambda k: extra[k])

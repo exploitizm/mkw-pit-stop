@@ -125,15 +125,17 @@ void perf_ledger(int kind, uint64_t ns) {
 // The ledger since the last present, with the replay's time (rep_ns) and the platform's page protection and PACK
 // unpacks (running totals, differenced here), into out as " name ms" pairs (under 0.05 ms left out); resets it and adds
 // it to the window's sums, which ledger_window prints every 60 presents as the normal frame's costs.
-enum { LG_REPLAY = PERF_LG_N, LG_PROT, LG_UNPACK, LG_ALL };
+enum { LG_REPLAY = PERF_LG_N, LG_PLAT, LG_ALL = LG_PLAT + PLAT_MEM_COST_N };
 static uint64_t lg_win[LG_ALL];
 
 static void ledger_fmt(char *out, size_t cap, const uint64_t *ns, double div) {
-    static const char *const extra[LG_ALL - PERF_LG_N] = {"replay", "prot", "unpack"};
+    static const char *const extra[LG_ALL - PERF_LG_N] = {"replay",      "prot_fault", "prot_arm", "prot_hold",
+                                                          "prot_change", "prot_early", "unpack",   "prot_calls"};
     size_t o = 0;
     out[0] = 0;
     for (int i = 0; i < LG_ALL && o < cap; i++) {
-        double ms = (double)ns[i] / 1e6 / div;
+        int count = i == LG_PLAT + PLAT_MEM_COST_PROT_CALLS;   // a count, not ns
+        double ms = (double)ns[i] / (count ? 1.0 : 1e6) / div;
         if (ms >= 0.05) o += (size_t)snprintf(out + o, cap - o, " %s %.2f", i < PERF_LG_N ? ledger_name[i] : extra[i - PERF_LG_N], ms);
     }
 }
@@ -144,8 +146,7 @@ static void ledger_take(char *out, size_t cap, uint64_t rep_ns) {
     plat_mem_cost_ns(pc);
     for (int i = 0; i < PERF_LG_N; i++) ns[i] = (uint64_t)plat_xchg64(&ledger[i], 0);
     ns[LG_REPLAY] = rep_ns;
-    ns[LG_PROT] = pc[PLAT_MEM_COST_PROT] - plat_prev[PLAT_MEM_COST_PROT];
-    ns[LG_UNPACK] = pc[PLAT_MEM_COST_UNPACK] - plat_prev[PLAT_MEM_COST_UNPACK];
+    for (int i = 0; i < PLAT_MEM_COST_N; i++) ns[LG_PLAT + i] = pc[i] - plat_prev[i];
     memcpy(plat_prev, pc, sizeof pc);
     for (int i = 0; i < LG_ALL; i++) lg_win[i] += ns[i];
     ledger_fmt(out, cap, ns, 1);

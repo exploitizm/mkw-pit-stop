@@ -310,9 +310,12 @@ uint64_t plat_mem_release_zero_backing(uint64_t addr, uint64_t size);
 // PS5: page-protection calls by caller since the last call (count, ns); ra 1 and 2 are the write watch's unprotect and
 // arm. Nothing elsewhere.
 void plat_mem_protect_stats(void (*emit)(uintptr_t ra, uint64_t n, uint64_t ns, void *ctx), void *ctx);
-// Running totals in ns of page-protection calls and PACK unpacks, every thread (PS5; zeros elsewhere): perf.c
-// differences them per frame for its cost ledger.
-enum { PLAT_MEM_COST_PROT, PLAT_MEM_COST_UNPACK, PLAT_MEM_COST_N };
+// Running totals of page-protection calls by kind (ns) and PACK unpacks (ns), every thread, and the protection calls'
+// count (PS5; zeros elsewhere): perf.c differences them per frame for its cost ledger. Kinds: the write watch's fault
+// unprotect, arm and hold unprotect (prot_watch.c), change_locked (freeze, thaw, plat_mem_protect) and the early-read
+// watch (plat_mem_early_*).
+enum { PLAT_MEM_COST_PROT_FAULT, PLAT_MEM_COST_PROT_ARM, PLAT_MEM_COST_PROT_HOLD, PLAT_MEM_COST_PROT_CHANGE,
+       PLAT_MEM_COST_PROT_EARLY, PLAT_MEM_COST_UNPACK, PLAT_MEM_COST_PROT_CALLS, PLAT_MEM_COST_N };
 void plat_mem_cost_ns(uint64_t out[PLAT_MEM_COST_N]);
 void plat_mem_back_causes(uint64_t out[PLAT_BACK_N]);
 int plat_mem_watch_info(uint64_t addr);
