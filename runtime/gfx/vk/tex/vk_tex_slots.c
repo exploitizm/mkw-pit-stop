@@ -103,7 +103,10 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
     return e;
 }
 
-void vk_texture_lock(void) { lock(); }
+void vk_texture_lock(void) {
+    lock();
+    if (rt_trace & RT_TRACE_PERF) tl_site((uint64_t)(uintptr_t)__builtin_return_address(0));
+}
 void vk_texture_unlock(void) { unlock(); }
 uint32_t vk_texture_slots_gen(void) { return slots_gen; }
 
