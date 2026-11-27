@@ -164,6 +164,10 @@ __attribute__((weak)) uint64_t plat_mem_release_backing(uint64_t addr, uint64_t 
 __attribute__((weak)) void plat_mem_protect_stats(void (*emit)(uintptr_t, uint64_t, uint64_t, void *), void *ctx) {
     (void)emit; (void)ctx;
 }
+__attribute__((weak)) int plat_mem_storm_take(char *out, size_t cap, uint32_t min_faults) {
+    (void)out, (void)cap, (void)min_faults;
+    return 0;
+}
 __attribute__((weak)) void plat_mem_cost_ns(uint64_t out[PLAT_MEM_COST_N]) {
     for (int i = 0; i < PLAT_MEM_COST_N; i++) out[i] = 0;
 }

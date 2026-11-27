@@ -584,6 +584,84 @@ static struct sigaction *prev_action_for(int sig) {
     }
 }
 
+// Fault storms (MKW_TRACE=perf, perf.c): per frame, the 2 MiB regions the game's writes faulted in, write-watch
+// unprotects (w) and unit backings (b: a packed unit's unpack, or a unit's first commit), how many hit the page right
+// after the region's previous one (seq), and the instructions that wrote. The protsplit bench (28/11/2026) found the
+// 1 % low's protection frames to be 130-374 fault unprotects in one frame (~20 normally) at the usual cost each, with
+// unpacks in the same frames: whether they are sequential runs and the same regions every lap decides the fix.
+// Lock-free and async-signal-safe (claimed slots, relaxed counts); plat_mem_storm_take clears the tables while other
+// threads may still add (a diagnostic: a few counts can land in the wrong frame).
+enum { STORM_REGS = 64, STORM_PCS = 32 };
+static struct { uint64_t key; uint32_t n[2], seq; uint64_t last; } storm_reg[STORM_REGS];
+static struct { uint64_t key; uint32_t n; } storm_pc[STORM_PCS];
+static uint32_t storm_total;
+
+static void storm_note(uint64_t addr, uint64_t pc, int kind) {
+    uint64_t key = (addr >> 21) + 1, page = addr & ~(uint64_t)(PS5_MEM_PAGE - 1);
+    __atomic_add_fetch(&storm_total, 1, __ATOMIC_RELAXED);
+    for (uint32_t i = (uint32_t)(key * 0x9e3779b1u) % STORM_REGS, k = 0; k < STORM_REGS; k++, i = (i + 1) % STORM_REGS) {
+        uint64_t cur = __atomic_load_n(&storm_reg[i].key, __ATOMIC_ACQUIRE), z = 0;
+        if (!cur && __atomic_compare_exchange_n(&storm_reg[i].key, &z, key, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            cur = key;
+        else if (!cur)
+            cur = z;
+        if (cur != key) continue;
+        __atomic_add_fetch(&storm_reg[i].n[kind], 1, __ATOMIC_RELAXED);
+        if (__atomic_exchange_n(&storm_reg[i].last, page, __ATOMIC_RELAXED) + PS5_MEM_PAGE == page)
+            __atomic_add_fetch(&storm_reg[i].seq, 1, __ATOMIC_RELAXED);
+        break;
+    }
+    if (!pc) return;
+    for (uint32_t i = (uint32_t)((pc >> 2) * 0x9e3779b1u) % STORM_PCS, k = 0; k < STORM_PCS; k++, i = (i + 1) % STORM_PCS) {
+        uint64_t cur = __atomic_load_n(&storm_pc[i].key, __ATOMIC_ACQUIRE), z = 0;
+        if (!cur && __atomic_compare_exchange_n(&storm_pc[i].key, &z, pc, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            cur = pc;
+        else if (!cur)
+            cur = z;
+        if (cur != pc) continue;
+        __atomic_add_fetch(&storm_pc[i].n, 1, __ATOMIC_RELAXED);
+        break;
+    }
+}
+
+int plat_mem_storm_take(char *out, size_t cap, uint32_t min_faults) {
+    uint32_t total = __atomic_exchange_n(&storm_total, 0, __ATOMIC_RELAXED);
+    int want = total >= min_faults && cap;
+    size_t o = 0;
+    if (want) o += (size_t)snprintf(out, cap, "%u faults;", total);
+    // the 6 busiest regions, then the 4 busiest writers, each emptied as it is read
+    for (int r = 0; r < 6; r++) {
+        int best = -1;
+        uint32_t bn = 0;
+        for (int i = 0; i < STORM_REGS; i++) {
+            uint32_t n = storm_reg[i].n[0] + storm_reg[i].n[1];
+            if (storm_reg[i].key && n > bn) best = i, bn = n;
+        }
+        if (best < 0) break;
+        if (want && o < cap)
+            o += (size_t)snprintf(out + o, cap - o, " %#llx w %u b %u seq %u;",
+                                  (unsigned long long)((storm_reg[best].key - 1) << 21), storm_reg[best].n[0],
+                                  storm_reg[best].n[1], storm_reg[best].seq);
+        storm_reg[best].n[0] = storm_reg[best].n[1] = 0;
+    }
+    if (want && o < cap) o += (size_t)snprintf(out + o, cap - o, " writers:");
+    uintptr_t base = plat_exe_base();
+    for (int r = 0; r < 4; r++) {
+        int best = -1;
+        uint32_t bn = 0;
+        for (int i = 0; i < STORM_PCS; i++)
+            if (storm_pc[i].key && storm_pc[i].n > bn) best = i, bn = storm_pc[i].n;
+        if (best < 0) break;
+        if (want && o < cap)
+            o += (size_t)snprintf(out + o, cap - o, " exe+%#llx %u", (unsigned long long)(storm_pc[best].key - base), bn);
+        storm_pc[best].n = 0;
+    }
+    for (int i = 0; i < STORM_REGS; i++) storm_reg[i].key = 0, storm_reg[i].n[0] = storm_reg[i].n[1] = 0, storm_reg[i].seq = 0, storm_reg[i].last = 0;
+    for (int i = 0; i < STORM_PCS; i++) storm_pc[i].key = 0, storm_pc[i].n = 0;
+    if (o >= cap && cap) out[cap - 1] = 0;
+    return want;
+}
+
 static void fault_handler(int sig, siginfo_t *si, void *uc) {
     ucontext_t *u = (ucontext_t *)uc;
 #ifdef __PROSPERO__
@@ -615,6 +693,7 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
             bool perm_ok = is_write ? (st == PS5_GUEST_RW) : (st >= PS5_GUEST_READ);
             if (committed && perm_ok && !unit->backing.committed) {
                 bool backed = back_unit_locked(unit, r->kind, 1, is_write ? PLAT_BACK_WRITE_FAULT : PLAT_BACK_READ_FAULT);
+                storm_note(addr, rip, 1);
                 // An armed page is read-only again (back_unit_locked): the retry faults once more and prot_watch_fault
                 // takes it as any watched write. Marked here, it would stay read-only with nothing to unprotect it.
                 uint64_t pg = addr & ~(uint64_t)(PS5_MEM_PAGE - 1);
@@ -629,6 +708,7 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
                     unit_unlock(unit);
                 } else if (is_write && prot_watch_fault(addr)) {
                     unit_unlock(unit);
+                    storm_note(addr, rip, 0);
                     ps5_mem_batch_swap(batch);
                     return;
                 } else {

@@ -569,8 +569,10 @@ void perf_present(uint64_t frame) {
         const char *e = cfg_get("MKW_PERF_SLOW_MS");
         slow_ns = (uint64_t)(e && atoi(e) > 0 ? atoi(e) : 50) * 1000000ull;
     }
-    char costs[384];
+    char costs[384], storm[512];
     ledger_take(costs, sizeof costs, rep);   // every present, so a slow frame's ledger is its own period's
+    if (plat_mem_storm_take(storm, sizeof storm, 64))   // 64+ write faults: ~3x a normal frame's (protsplit, 28/11)
+        rt_log("perf: fault storm frame %llu: %s", (unsigned long long)frame, storm);
     if (last) {
         sum += d;
         n++;

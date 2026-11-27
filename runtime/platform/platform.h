@@ -317,6 +317,9 @@ void plat_mem_protect_stats(void (*emit)(uintptr_t ra, uint64_t n, uint64_t ns, 
 enum { PLAT_MEM_COST_PROT_FAULT, PLAT_MEM_COST_PROT_ARM, PLAT_MEM_COST_PROT_HOLD, PLAT_MEM_COST_PROT_CHANGE,
        PLAT_MEM_COST_PROT_EARLY, PLAT_MEM_COST_UNPACK, PLAT_MEM_COST_PROT_CALLS, PLAT_MEM_COST_N };
 void plat_mem_cost_ns(uint64_t out[PLAT_MEM_COST_N]);
+// The fault storm since the last call (PS5; 0 elsewhere): with min_faults or more, the busiest regions and writers into
+// out and 1; the tables are cleared either way (ps5_guest_memory.c storm_note).
+int plat_mem_storm_take(char *out, size_t cap, uint32_t min_faults);
 void plat_mem_back_causes(uint64_t out[PLAT_BACK_N]);
 int plat_mem_watch_info(uint64_t addr);
 void plat_mem_gpu_import(uint64_t addr, size_t n, int on);
