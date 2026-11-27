@@ -1573,7 +1573,12 @@ static int pk_unit(Ps5MixedBlock *u, RangeKind kind, const PlatPackParams *pp, i
     if (prot_watch_has_gpu(a, PS5_MEM_UNIT)) return pk_skip(SK_GPU), 0;
     // Signed: a time made odd (| 1) may be 1 ms ahead of now_ms.
     uint32_t since = since_fn(a), up = __atomic_load_n(&u->pk_unpack_ms, __ATOMIC_RELAXED);
-    uint32_t cold = pp->cold_ms << (pp->backoff ? __atomic_load_n(&u->pk_bounces, __ATOMIC_RELAXED) : 0);
+    // MKW_PACK_BACKOFF=2: a unit read back once stays unpacked. Moving the pack's work to other threads or into
+    // slices changed nothing (28/11/2026: PACK_SLICE and an unpack-ahead thread, in-race A/Bs), so the lever left is
+    // fewer pack and unpack cycles: memory a lap reads again is not cold, whatever its cold time.
+    uint32_t bounces = __atomic_load_n(&u->pk_bounces, __ATOMIC_RELAXED);
+    if (pp->backoff == 2 && bounces) return pk_skip(SK_YOUNG), 0;
+    uint32_t cold = pp->cold_ms << (pp->backoff ? bounces : 0);
     if (!since || (int32_t)(now_ms - since) < (int32_t)cold || (up && (int32_t)(now_ms - up) < (int32_t)cold))
         return pk_skip(SK_YOUNG), 0;
     uint64_t need = sizeof(PackBlob) + pk_cbound + (pp->verify ? PS5_MEM_UNIT : 0);

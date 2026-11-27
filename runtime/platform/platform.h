@@ -367,7 +367,7 @@ typedef struct {
     uint32_t cold_ms;        // frozen at least this long, and not unpacked for this long
     uint32_t budget_us;      // stop after this long (0 none)
     int verify;              // keep each unit's bytes too and compare them on unpack (MKW_PACK_VERIFY)
-    int backoff;             // a unit unpacked again waits twice as long, each time (MKW_PACK_BACKOFF)
+    int backoff;             // a unit unpacked again waits twice as long, each time; 2: never packed again (MKW_PACK_BACKOFF)
 } PlatPackParams;
 uint64_t plat_mem_pack(const PlatPackParams *p);   // bytes of direct memory given back
 uint64_t plat_mem_pack_range(uint64_t lo, uint64_t hi, const PlatPackParams *p);   // the same over [lo, hi) only

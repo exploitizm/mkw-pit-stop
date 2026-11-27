@@ -66,7 +66,9 @@ def classify(
     if extra:
         name = max(extra, key=lambda k: extra[k])
         path = [name]
-        while kids := [k for k in CHILDREN.get(name, []) if extra.get(k, 0) >= 0.5 * extra[name]]:
+        while extra[name] > 0 and (
+            kids := [k for k in CHILDREN.get(name, []) if k in extra and extra[k] >= 0.5 * extra[name]]
+        ):
             name = max(kids, key=lambda k: extra[k])
             path.append(name)
         if extra[path[0]] >= 0.25 * excess:

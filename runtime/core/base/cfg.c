@@ -155,7 +155,7 @@ static const CfgRow rows[] = {
     S("REPLAY_PAR", "performance", REPLAY_PAR_DEFAULT, "0|1|2", RESTART),
     S("PACK", NULL, "0", "0|1", RESTART),   // PS5 (on in its profile): cold guest memory compressed (vk_mem_upload.c pack_step)
     S("PACK_TEXFREE", NULL, "0", "0|1", RESTART),   // PS5 (on in its profile, with PACK): the texture heap's free blocks packed first (vk_mem_upload.c texfree_pack)
-    S("PACK_BACKOFF", NULL, "1", "0|1", RESTART),   // MKW_PACK: a unit read back waits twice as long before the next pack
+    S("PACK_BACKOFF", NULL, "1", "0|1|2", RESTART),   // MKW_PACK: a unit read back waits twice as long before the next pack; 2: is never packed again
     S("FREE_CORES", "performance", "0", "0|1", RESTART),
     S("TIMER_1MS", "performance", "1", "0|1", RESTART),
     // shaders and pipelines
