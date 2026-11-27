@@ -65,6 +65,9 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
                                            .dynamicStateCount = P.n_dyn, .pDynamicStates = P.dyn};
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
                                        .flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR, .pDynamicState = &dy};
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+    if (vk_ctx()->use_desc_buf) pi.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+#endif
     VkShaderModule m = VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo st = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pName = "main"};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rq;
@@ -380,6 +383,9 @@ VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc, int b
                                              .pLibraries = lib};
         VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &li,
                                            .layout = l->layout};
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+        if (vk_ctx()->use_desc_buf) pi.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+#endif
         if (build) plat_mutex_unlock(&P.lock);
         uint64_t t1 = pipe_qpc();
         if (vkCreateGraphicsPipelines(P.device, VK_NULL_HANDLE, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;

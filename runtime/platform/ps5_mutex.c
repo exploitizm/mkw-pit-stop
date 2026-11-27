@@ -20,11 +20,36 @@
 #include <string.h>
 #include <time.h>
 
-static int fast_lock_on, locks_made;
+static int fast_lock_on, pi_mode, locks_made;
 
 int plat_lock_fast_mode(int on) {
     __atomic_store_n(&fast_lock_on, on ? 1 : 0, __ATOMIC_RELEASE);
     return __atomic_load_n(&locks_made, __ATOMIC_ACQUIRE);
+}
+
+int plat_lock_prio_inherit_mode(int mode) {
+    __atomic_store_n(&pi_mode, mode >= 0 && mode <= 2 ? mode : 0, __ATOMIC_RELEASE);
+    return __atomic_load_n(&locks_made, __ATOMIC_ACQUIRE);
+}
+
+static int init_mutex_pi(pthread_mutex_t *m, int want_pi) {
+    if (!want_pi) return pthread_mutex_init(m, NULL);
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr)) return pthread_mutex_init(m, NULL);
+#ifdef PTHREAD_PRIO_INHERIT
+    int prc = pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
+    if (prc) {
+        static int warned;
+        if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "ps5_mutex: PTHREAD_PRIO_INHERIT unsupported (%d: %s), falling back to default mutex\n",
+                    prc, strerror(prc));
+        pthread_mutexattr_destroy(&attr);
+        return pthread_mutex_init(m, NULL);
+    }
+#endif
+    int rc = pthread_mutex_init(m, &attr);
+    pthread_mutexattr_destroy(&attr);
+    return rc;
 }
 
 // ---- MKW_LOCK_PROF (ported from linux_sync.c)
@@ -104,6 +129,7 @@ int plat_lock_report(int holds, char *buf, int size) {
 
 typedef struct {
     int fast;
+    int pi_mtx;   // MKW_PS5_PRIO_INHERIT=2: exclusive PTHREAD_PRIO_INHERIT pthread_mutex_t in m
     pthread_rwlock_t rw;
     volatile uint32_t word;
     volatile uint32_t waiters;           // threads between taking m to sleep and leaving (m)
@@ -118,9 +144,13 @@ static Ps5Lock *get_lock(PlatMutex *mutex) {
 
     Ps5Lock *created = calloc(1, sizeof *created);
     if (!created) abort();
+    int pi = __atomic_load_n(&pi_mode, __ATOMIC_ACQUIRE);
     created->fast = __atomic_load_n(&fast_lock_on, __ATOMIC_ACQUIRE);
+    created->pi_mtx = !created->fast && pi >= 2;
     if (created->fast) {
-        if (pthread_mutex_init(&created->m, NULL) || pthread_cond_init(&created->cv, NULL)) abort();
+        if (init_mutex_pi(&created->m, pi >= 1) || pthread_cond_init(&created->cv, NULL)) abort();
+    } else if (created->pi_mtx) {
+        if (init_mutex_pi(&created->m, 1)) abort();
     } else {
         if (pthread_rwlock_init(&created->rw, NULL)) abort();
     }
@@ -130,6 +160,8 @@ static Ps5Lock *get_lock(PlatMutex *mutex) {
     }
     if (created->fast) {
         pthread_cond_destroy(&created->cv);
+        pthread_mutex_destroy(&created->m);
+    } else if (created->pi_mtx) {
         pthread_mutex_destroy(&created->m);
     } else {
         pthread_rwlock_destroy(&created->rw);
@@ -190,6 +222,18 @@ static void lock_at(PlatMutex *mutex, uintptr_t ra) {
             pthread_mutex_unlock(&l->m);
         }
     }
+    if (l->pi_mtx) {
+        uint64_t t0 = 0;
+        if (lp_on != 0 && pthread_mutex_trylock(&l->m) == 0) {
+            if (lp_on > 0) lh_push(mutex, ra);
+            return;
+        }
+        if (lp_on != 0) t0 = lp_begin();
+        if (pthread_mutex_lock(&l->m)) abort();
+        if (t0) lp_add(lp, mutex, t0, ra);
+        if (lp_on > 0) lh_push(mutex, ra);
+        return;
+    }
     uint64_t t0 = 0;
     if (lp_on != 0 && pthread_rwlock_trywrlock(&l->rw) == 0) {
         if (lp_on > 0) lh_push(mutex, ra);
@@ -212,6 +256,7 @@ int plat_mutex_trylock(PlatMutex *mutex) {
             if (__atomic_compare_exchange_n(&l->word, &s, s | LK_W, 1, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 1;
         return 0;
     }
+    if (l->pi_mtx) return pthread_mutex_trylock(&l->m) == 0;
     return pthread_rwlock_trywrlock(&l->rw) == 0;
 }
 
@@ -224,6 +269,10 @@ void plat_mutex_unlock(PlatMutex *mutex) {
         return;
     }
     if (lp_on > 0) lh_pop(mutex, 0);
+    if (l->pi_mtx) {
+        if (pthread_mutex_unlock(&l->m)) abort();
+        return;
+    }
     if (pthread_rwlock_unlock(&l->rw)) abort();
 }
 
@@ -250,6 +299,14 @@ void plat_mutex_lock_shared(PlatMutex *mutex) {
             pthread_mutex_unlock(&l->m);
         }
     }
+    if (l->pi_mtx) {
+        uint64_t t0 = 0;
+        if (lp_on != 0 && pthread_mutex_trylock(&l->m) == 0) return;
+        if (lp_on != 0) t0 = lp_begin();
+        if (pthread_mutex_lock(&l->m)) abort();
+        if (t0) lp_add(lp, mutex, t0, ra);
+        return;
+    }
     uint64_t t0 = 0;
     if (lp_on != 0 && pthread_rwlock_tryrdlock(&l->rw) == 0) return;
     if (lp_on != 0) t0 = lp_begin();
@@ -265,6 +322,7 @@ int plat_mutex_trylock_shared(PlatMutex *mutex) {
             if (__atomic_compare_exchange_n(&l->word, &s, s + 1, 1, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 1;
         return 0;
     }
+    if (l->pi_mtx) return pthread_mutex_trylock(&l->m) == 0;
     return pthread_rwlock_tryrdlock(&l->rw) == 0;
 }
 
@@ -273,6 +331,10 @@ void plat_mutex_unlock_shared(PlatMutex *mutex) {
     if (l->fast) {
         uint32_t s = __atomic_sub_fetch(&l->word, 1, __ATOMIC_RELEASE);
         if ((s & LK_S) && !(s & LK_R)) fast_wake(l);
+        return;
+    }
+    if (l->pi_mtx) {
+        if (pthread_mutex_unlock(&l->m)) abort();
         return;
     }
     if (pthread_rwlock_unlock(&l->rw)) abort();
@@ -291,7 +353,8 @@ static Cond *condition(PlatCond *cond) {
 
     Cond *created = malloc(sizeof *created);
     pthread_condattr_t attr;
-    if (!created || pthread_mutex_init(&created->gate, NULL) || pthread_condattr_init(&attr) ||
+    int want_pi = __atomic_load_n(&pi_mode, __ATOMIC_ACQUIRE) >= 1;
+    if (!created || init_mutex_pi(&created->gate, want_pi) || pthread_condattr_init(&attr) ||
         pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) || pthread_cond_init(&created->cond, &attr))
         abort();
     pthread_condattr_destroy(&attr);

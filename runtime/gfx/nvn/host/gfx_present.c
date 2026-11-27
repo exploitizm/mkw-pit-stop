@@ -1044,11 +1044,25 @@ static void present_image_ex(VkImage src, VkImageLayout layout, VkFormat fmt, in
         if (general)   // a GENERAL source (vk_texture.c images): earlier submissions' writes become visible to the blit here
             sync_barrier(cb, src, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                          VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-        VkImageBlit region = {
-            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{cx, cy, 0}, {cx + cw, cy + ch, 1}},
-            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{to[0], to[1], 0}, {to[0] + to[2], to[1] + to[3], 1}}};
-        vkCmdBlitImage(cb, src, general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
+        // MKW_PRESENT_COPY (default 1; "ab" in the B blocks): pure DMA vkCmdCopyImage when the picture matches the
+        // swapchain 1:1 in both extent and format, avoiding the linear-filter blit shader pass (present-copy-ab on PS5,
+        // 28/11/2026, 82 A vs 85 B windows: frame 17.32 -> 17.12 ms, median 16.89 -> 16.69, busy -1.32 ms, GPU -0.43 ms).
+        static int copy_k = -1;
+        if (copy_k < 0) copy_k = rt_knob("PRESENT_COPY", "1");
+        if (RT_KNOB_ON(copy_k) && cw > 0 && ch > 0 && cw == to[2] && ch == to[3] && fmt == g_sc_fmt) {
+            VkImageCopy region = {
+                .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffset = {cx, cy, 0},
+                .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffset = {to[0], to[1], 0},
+                .extent = {(uint32_t)cw, (uint32_t)ch, 1}};
+            vkCmdCopyImage(cb, src, general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        } else {
+            VkImageBlit region = {
+                .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{cx, cy, 0}, {cx + cw, cy + ch, 1}},
+                .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{to[0], to[1], 0}, {to[0] + to[2], to[1] + to[3], 1}}};
+            vkCmdBlitImage(cb, src, general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
+        }
         if (general)   // later submissions that write the source wait for the blit's read
             sync_barrier(cb, src, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0,
                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);

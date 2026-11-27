@@ -846,6 +846,9 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l, uint32_t 
     }
     if (vk_ctx()->has_exec_stats) ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     if (vk_ctx()->has_exec_stats && cfg_get("MKW_SPEC_ISA")) ci.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+    if (vk_ctx()->use_desc_buf) ci.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+#endif
     VkPipeline pipe = VK_NULL_HANDLE;
     if (vkCreateComputePipelines(P.device, P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
     else if (vk_ctx()->has_exec_stats) log_stats(pipe, &(VkPipeState){.vs = cs});

@@ -45,6 +45,13 @@ void rec_blend_equation(PFN_vkCmdSetColorBlendEquationEXT fn, VkCommandBuffer cb
                         const VkColorBlendEquationEXT *v);
 void rec_write_mask(PFN_vkCmdSetColorWriteMaskEXT fn, VkCommandBuffer cb, uint32_t first, uint32_t n,
                     const VkColorComponentFlags *v);
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+void rec_bind_desc_bufs(PFN_vkCmdBindDescriptorBuffersEXT fn, VkCommandBuffer cb, uint32_t n,
+                        const VkDescriptorBufferBindingInfoEXT *infos);
+void rec_set_desc_buf_offsets(PFN_vkCmdSetDescriptorBufferOffsetsEXT fn, VkCommandBuffer cb, VkPipelineBindPoint bp,
+                              VkPipelineLayout layout, uint32_t first, uint32_t n, const uint32_t *idx,
+                              const VkDeviceSize *offs);
+#endif
 
 #define REC_CMDS(X)                                                                                                       \
     X(BeginQuery, (VkCommandBuffer cb, VkQueryPool p, uint32_t q, VkQueryControlFlags f), (cb, p, q, f))                  \

@@ -343,3 +343,6 @@ void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload);
 // when counting and none is active), and the open pass about to end (ends the active query).
 void vk_exec_oq_draw(VkExec *ex);
 void vk_exec_oq_pass_end(VkExec *ex);
+// vk_exec_par.c: pins the parallel chunk recording worker threads to mask (and remembers mask for workers spawned later).
+void vk_exec_par_affinity(uint64_t mask);
+int vk_exec_par_thread_count(void);

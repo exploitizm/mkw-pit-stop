@@ -541,7 +541,7 @@ int vk_pipeline_vertex_input_dynamic(void) { return ensure_init() && P.dyn_vi; }
 PFN_vkCmdPushDescriptorSetKHR vk_pipeline_push_fn(void) { return ensure_init() ? P.push : NULL; }
 PFN_vkCmdPushDescriptorSetWithTemplateKHR vk_pipeline_push_tpl_fn(void) { return ensure_init() && P.tpl ? P.tpl_push : NULL; }
 PFN_vkUpdateDescriptorSetWithTemplate vk_pipeline_update_tpl_fn(void) { return ensure_init() && P.tpl ? P.tpl_update : NULL; }
-int vk_pipeline_draw_cache(void) { return ensure_init() && P.draw_cache; }
+int vk_pipeline_draw_cache(void) { return ensure_init() && P.draw_cache && !vk_ctx()->use_desc_buf; }
 
 // ---- SPIR-V rewrites: vk_spirv_patch.c
 
@@ -598,7 +598,11 @@ Pipe *pipe_add(const void *key, size_t size, uint64_t h, VkPipeline pipeline, co
     p->info.set_layout1 = l ? l->set1 : VK_NULL_HANDLE;
     p->info.push1 = l ? l->push1 : 0;
     p->info.n_sets = l && l->set1 ? 2 : 1;
-    if (l) p->info.tpl[0] = l->tpl[0], p->info.tpl[1] = l->tpl[1];
+    if (l) {
+        p->info.tpl[0] = l->tpl[0], p->info.tpl[1] = l->tpl[1];
+        p->info.db_size[0] = l->db_size[0], p->info.db_size[1] = l->db_size[1];
+        p->info.db_off = l->db_off;
+    }
     p->lay = l;
     Pipe **head = &pipes[h % PIPE_BUCKETS];
     p->next = *head;
@@ -816,6 +820,9 @@ static VkPipeline create_mesh(const VkPipeState *s, const GKey *k, const Layout 
                                        .stageCount = n, .pStages = st, .pViewportState = &vp, .pRasterizationState = &rs,
                                        .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
                                        .pDynamicState = &dy, .layout = l->layout};
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+    if (vk_ctx()->use_desc_buf) pi.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+#endif
     uint64_t p0 = perf_begin();
     VkResult r = vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe);
     perf_end(PERF_PIPE, p0);
@@ -1082,6 +1089,9 @@ VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l,
     if (k->fbl & 2) pi.flags |= VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     if (vk_ctx()->has_exec_stats) pi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     if (vk_ctx()->has_exec_stats && cfg_get("MKW_SPEC_ISA")) pi.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+    if (vk_ctx()->use_desc_buf) pi.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+#endif
     uint64_t p0 = perf_begin();
     VkResult r = vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe);
     perf_end(PERF_PIPE, p0);   // counts on the render thread only, so background builds stay out of it
@@ -1335,6 +1345,7 @@ void vk_pipeline_shutdown(void) {
                 if (l->half[h]) vkDestroyPipelineLayout(P.device, l->half[h], NULL);
             vkDestroyDescriptorSetLayout(P.device, l->set, NULL);
             if (l->set1) vkDestroyDescriptorSetLayout(P.device, l->set1, NULL);
+            free(l->db_off);
             free(l);
         }
         layouts[i] = NULL;

@@ -407,6 +407,10 @@ static void exec_packet(uint32_t op, void *p) {
     case R_BlendEnable: { A_Targets *a = p; ((PFN_vkCmdSetColorBlendEnableEXT)a->fn)(cb, a->first, a->n, a->v); break; }
     case R_BlendEquation: { A_Targets *a = p; ((PFN_vkCmdSetColorBlendEquationEXT)a->fn)(cb, a->first, a->n, a->v); break; }
     case R_WriteMask: { A_Targets *a = p; ((PFN_vkCmdSetColorWriteMaskEXT)a->fn)(cb, a->first, a->n, a->v); break; }
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+    case R_BindDescBufs: { A_BindDescBufs *a = p; a->fn(cb, a->n, a->infos); break; }
+    case R_SetDescBufOffs: { A_SetDescBufOffs *a = p; a->fn(cb, a->bp, a->l, a->first, a->n, a->idx, a->offs); break; }
+#endif
     default: rt_fatal("vk_rec: unknown packet %u", op);
     }
 }

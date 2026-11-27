@@ -31,11 +31,13 @@ static void *grow(void *p, int *cap, size_t elem) {
 
 // ---- resources of one command buffer, freed by its completion callback
 
-typedef struct { VkBuffer buf; VmaAllocation alloc; uint8_t *map; uint64_t size, used; } Chunk;
+typedef struct { VkBuffer buf; VmaAllocation alloc; uint8_t *map; uint64_t size, used; VkDeviceAddress addr; } Chunk;
 typedef struct { uint64_t addr, size; int own; } Range;   // own: reported at the fence here (vk_exec_written.c)
 struct CbRes {
     Chunk *chunks;
     int nchunks, cchunks;
+    Chunk *db_chunks;
+    int ndb, cdb;
     VkDescriptorPool *pools;
     int npools, cpools;
     Range *written;
@@ -52,7 +54,8 @@ struct CbRes {
 static PlatMutex spare_lock = PLAT_MUTEX_INIT;
 static VkDescriptorPool spare_pool[SPARE_POOLS];
 static Chunk spare_chunk[SPARE_CHUNKS];
-static int nspare_pool, nspare_chunk;
+static Chunk spare_db[SPARE_CHUNKS];
+static int nspare_pool, nspare_chunk, nspare_db;
 static int cb_live_pools, cb_live_chunks;
 
 void vk_exec_cb_dpool_stats(int *live_pools, int *spare_pools, int *live_chunks, int *spare_chunks) {
@@ -94,7 +97,14 @@ static void cb_done(void *arg) {   // completion thread
         plat_mutex_unlock(&spare_lock);
         if (!kept) vmaDestroyBuffer(c->vma, r->chunks[i].buf, r->chunks[i].alloc), __atomic_sub_fetch(&cb_live_chunks, 1, __ATOMIC_RELAXED);
     }
-    free(r->written), free(r->wslot), free(r->pools), free(r->chunks), free(r);
+    for (int i = 0; i < r->ndb; i++) {
+        plat_mutex_lock(&spare_lock);
+        int kept = r->db_chunks[i].size == CHUNK_BYTES && nspare_db < SPARE_CHUNKS;
+        if (kept) spare_db[nspare_db++] = r->db_chunks[i];
+        plat_mutex_unlock(&spare_lock);
+        if (!kept) vmaDestroyBuffer(c->vma, r->db_chunks[i].buf, r->db_chunks[i].alloc);
+    }
+    free(r->written), free(r->wslot), free(r->pools), free(r->chunks), free(r->db_chunks), free(r);
 }
 
 CbRes *cb_res_new(VkExec *ex) {
@@ -131,7 +141,8 @@ uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n,
                                  .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                          (vk_ctx()->use_desc_buf ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0)};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
                                       .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
         VmaAllocationInfo info;
@@ -279,8 +290,71 @@ void vk_exec_cb_shutdown(void) {
     VkCtx *c = vk_ctx();
     for (int i = 0; i < nspare_pool; i++) vkDestroyDescriptorPool(c->device, spare_pool[i], NULL), __atomic_sub_fetch(&cb_live_pools, 1, __ATOMIC_RELAXED);
     for (int i = 0; i < nspare_chunk; i++) vmaDestroyBuffer(c->vma, spare_chunk[i].buf, spare_chunk[i].alloc), __atomic_sub_fetch(&cb_live_chunks, 1, __ATOMIC_RELAXED);
-    nspare_pool = nspare_chunk = 0;
+    for (int i = 0; i < nspare_db; i++) vmaDestroyBuffer(c->vma, spare_db[i].buf, spare_db[i].alloc);
+    nspare_pool = nspare_chunk = nspare_db = 0;
 }
+
+#ifdef VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+uint8_t *db_alloc(VkExec *ex, VkDeviceSize size, VkDeviceSize *off) {
+    VkCtx *vc = vk_ctx();
+    CbRes *r = cb_res(ex);
+    VkDeviceSize al = vc->db.align;
+    size = (size + al - 1) & ~(al - 1);
+    if (!size) size = al;
+    Chunk *ch = r->ndb ? &r->db_chunks[r->ndb - 1] : NULL;
+    if (!ch || ch->used + size > ch->size) {
+        if (r->ndb == r->cdb) r->db_chunks = grow(r->db_chunks, &r->cdb, sizeof *r->db_chunks);
+        ch = &r->db_chunks[r->ndb];
+        uint64_t n = size > CHUNK_BYTES ? size : CHUNK_BYTES;
+        int reused = 0;
+        if (n == CHUNK_BYTES) {
+            plat_mutex_lock(&spare_lock);
+            if (nspare_db) *ch = spare_db[--nspare_db], reused = 1;
+            plat_mutex_unlock(&spare_lock);
+        }
+        if (reused) {
+            ch->used = 0;
+            r->ndb++;
+        } else {
+            VkBufferCreateInfo bi = {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n,
+                .usage = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+                         VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
+                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
+            VmaAllocationCreateInfo ai = {
+                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+            VmaAllocationInfo info;
+            VkResult res = vmaCreateBuffer(vc->vma, &bi, &ai, &ch->buf, &ch->alloc, &info);
+            if (res != VK_SUCCESS) {
+                vk_mem_relieve(2 * n + (8ull << 20), "a descriptor buffer chunk");
+                res = vmaCreateBuffer(vc->vma, &bi, &ai, &ch->buf, &ch->alloc, &info);
+            }
+            if (res != VK_SUCCESS) {
+                vk_oom_census("descriptor buffer");
+                rt_fatal("vk: descriptor buffer chunk of %llu bytes failed (%d)", (unsigned long long)n, (int)res);
+            }
+            VkBufferDeviceAddressInfo di = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = ch->buf};
+            ch->addr = vkGetBufferDeviceAddress(vc->device, &di);
+            ch->map = info.pMappedData, ch->size = n, ch->used = 0;
+            r->ndb++;
+        }
+    }
+    if (B.db_bound_addr != ch->addr) {
+        VkDescriptorBufferBindingInfoEXT bbi = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT, .address = ch->addr,
+            .usage = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT | VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT};
+        rec_bind_desc_bufs(vc->db.cmd_bind_bufs, ex->cb, 1, &bbi);
+        B.db_bound_addr = ch->addr;
+        B.db_last_layout[0] = B.db_last_layout[1] = VK_NULL_HANDLE;
+        B.db_bound_addr_set[0] = B.db_bound_addr_set[1] = 0;
+    }
+    *off = ch->used;
+    uint8_t *p = ch->map + ch->used;
+    ch->used += size;
+    return p;
+}
+#endif
 
 // ---- state recorded outside descriptors
 

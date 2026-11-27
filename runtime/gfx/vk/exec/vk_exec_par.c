@@ -129,6 +129,9 @@ static struct {
     PlatMutex lock;
     PlatCond work, finished;
     ThreadCbs tcb[MAX_THREADS + 1];   // 0: the replay thread
+    PlatThread *thr[MAX_THREADS];     // chunk recording worker handles (vk_exec_par_affinity)
+    int nthr;                         // spawned workers in thr[0..nthr)
+    uint64_t thr_mask;                // affinity mask for chunk workers (0: inherit default)
     // since the last perf line
     uint64_t t_job, first_ns;   // when the chunks were handed out; summed: until the first send (the GPU starts there)
     uint64_t n_par, n_serial[WHY_N], n_chunks, n_draws, walk_ns, rec_ns, max_rec_ns, drops_early, w_subs, w_frames0, n_cond, n_again;
@@ -766,11 +769,25 @@ static void setup(void) {
     if (P.walk_diag) rt_log("vk: light walk of each submission before its replay (MKW_REPLAY_WALK, a measurement)");
     if (!P.mode) return;
     plat_cond_init(&P.work), plat_cond_init(&P.finished);
-    for (int t = 1; t <= P.threads; t++)
-        if (!plat_thread_spawn(worker_main, (void *)(intptr_t)t, "vk chunks", 0)) rt_fatal("vk: cannot start a replay chunk thread");
+    uint64_t mask = __atomic_load_n(&P.thr_mask, __ATOMIC_ACQUIRE);
+    for (int t = 1; t <= P.threads; t++) {
+        PlatThread *th = plat_thread_new_ex(worker_main, (void *)(intptr_t)t, "vk chunks", 0);
+        if (!th) rt_fatal("vk: cannot start a replay chunk thread");
+        if (mask) plat_thread_affinity(th, mask);
+        P.thr[P.nthr++] = th;
+    }
     rt_log("vk: replay in chunks of %d draws on %d threads besides the replay thread%s (MKW_REPLAY_PAR)", P.chunk_draws,
            P.threads, P.mode == 2 ? ", in the B blocks" : "");
 }
+
+void vk_exec_par_affinity(uint64_t mask) {
+    __atomic_store_n(&P.thr_mask, mask, __ATOMIC_RELEASE);
+    int n = __atomic_load_n(&P.nthr, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++)
+        if (P.thr[i]) plat_thread_affinity(P.thr[i], mask);
+}
+
+int vk_exec_par_thread_count(void) { return __atomic_load_n(&P.nthr, __ATOMIC_ACQUIRE); }
 
 // A chunk that bound a uniform snapshot copy at a position after a GPU write into that region (made by an earlier
 // chunk that recorded later) has to bind guest memory there: the chunk records again, now that every drop position
