@@ -36,6 +36,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 WINDOWS = os.name == "nt"
+DARWIN = sys.platform == "darwin"
 REDIST = "https://developer.download.nvidia.com/compute/cuda/redist"
 PINS = {  # tool: (package path under REDIST, sha256), from NVIDIA's redistrib_12.8.1.json
     "linux": {
@@ -82,6 +83,8 @@ def https_context() -> ssl.SSLContext:
     unreadable to this Python), explicitly: on Windows the default context reads the system store whatever the variable
     says, and a certificate in it Python cannot parse stops every download (issue #456)."""
     ca = os.environ.get("SSL_CERT_FILE")
+    if not ca and DARWIN and Path("/etc/ssl/cert.pem").is_file():
+        ca = "/etc/ssl/cert.pem"
     return ssl.create_default_context(cafile=ca) if ca else ssl.create_default_context()
 
 
@@ -127,7 +130,15 @@ def tool(name: str, cache: Path) -> Path:
     exe = cache / "bin" / (name + ".exe" if WINDOWS else name)
     if exe.is_file():
         return exe
-    host = "windows" if WINDOWS else "linux-aarch64" if platform.machine() in ("aarch64", "arm64") else "linux"
+    if WINDOWS:
+        host = "windows"
+    elif DARWIN:
+        # macOS runs the pinned Linux x86-64 CUDA 12.8 tools inside the bundled blink emulator.
+        host = "linux"
+    elif platform.machine() in ("aarch64", "arm64"):
+        host = "linux-aarch64"
+    else:
+        host = "linux"
     rel, want = PINS[host][name]
     archive = fetch(rel, want, cache)
     exe.parent.mkdir(parents=True, exist_ok=True)
@@ -176,6 +187,50 @@ def no_aslr() -> None:
     ctypes.CDLL(None).personality(0x0040000)  # ADDR_NO_RANDOMIZE
 
 
+def _find_blink() -> Path:
+    """Locate the bundled or system blink x86-64 Linux emulator on macOS."""
+    for cand in (
+        Path(os.environ["MKW_BLINK"]) if os.environ.get("MKW_BLINK") else None,
+        ROOT.parent / "bin/blink",
+        ROOT / "build/macos-cache/blink",
+        Path(shutil.which("blink") or "") if shutil.which("blink") else None,
+    ):
+        if cand and cand.is_file():
+            return cand
+    raise FileNotFoundError("blink x86-64 Linux emulator not found for macOS sm86 spec generation")
+
+
+def _find_linux_sysroot() -> Path:
+    """Locate the minimal x86-64 glibc sysroot used by blink on macOS."""
+    for cand in (
+        Path(os.environ["MKW_LINUX_SYSROOT"]) if os.environ.get("MKW_LINUX_SYSROOT") else None,
+        ROOT.parent / "linux-sysroot",
+        ROOT / "build/macos-cache/linux-sysroot",
+    ):
+        if cand and (cand / "lib64/ld-linux-x86-64.so.2").is_file():
+            return cand
+    raise FileNotFoundError("linux-sysroot/lib64/ld-linux-x86-64.so.2 not found for macOS sm86 spec generation")
+
+
+def _blink_cmd(bin_path: Path, preload: Path | None = None) -> tuple[list[str], dict[str, str]]:
+    """Build a blink -m invocation for a Linux x86-64 binary on macOS (16 KB Apple Silicon page skew safe)."""
+    blink = _find_blink()
+    sysroot = _find_linux_sysroot()
+    lib64 = sysroot / "lib64"
+    cmd = [str(blink), "-m", "-L", "/dev/null", str(lib64 / "ld-linux-x86-64.so.2"), "--library-path", str(lib64)]
+    if preload:
+        cmd.extend(["--preload", str(preload)])
+    cmd.append(str(bin_path))
+    env = dict(
+        os.environ,
+        MALLOC_MMAP_THRESHOLD_="0",
+        OMP_NUM_THREADS="1",
+        OMP_THREAD_LIMIT="1",
+        BLINK_LOG_FILENAME="/dev/null",
+    )
+    return cmd, env
+
+
 def intercept_lib(cc: list[str], work: Path, crt: Path | None) -> Path:
     if WINDOWS:
         dll = work / "intercept.dll"
@@ -195,6 +250,11 @@ def intercept_lib(cc: list[str], work: Path, crt: Path | None) -> Path:
         subprocess.run(lld_link(cc[0], crt, dll, [str(obj)], f"-IMPLIB:{work / 'intercept.lib'}"), check=True)
         return dll
     so = work / "intercept.so"
+    if DARWIN:
+        if Path(cc[0]).stem == "zig":
+            cc = [cc[0], "cc", "-target", "x86_64-linux-gnu"]
+        elif "-target" not in cc:
+            cc = [*cc, "-target", "x86_64-linux-gnu"]
     # -nostdlib and libc after the object: zig cc otherwise links its own memcpy and hides intercept.c's; -O2 and no
     # sanitizer: zig's debug default calls UBSan handlers nvdisasm does not have.
     subprocess.run([*cc, "-O2", "-fno-sanitize=undefined", "-fPIC", "-shared", "-nostdlib", "-o", str(so),
@@ -242,6 +302,9 @@ def inject(proc: subprocess.Popen, dll: Path) -> None:
 
 
 def run_nvdisasm(nvdisasm: Path, lib: Path, cubin: Path) -> bytes:
+    if DARWIN:
+        cmd, env = _blink_cmd(nvdisasm, preload=lib)
+        return subprocess.run([*cmd, str(cubin)], env=env, capture_output=True, check=True).stdout
     if not WINDOWS:
         env = dict(os.environ, LD_PRELOAD=str(lib), OMP_NUM_THREADS="1", OMP_THREAD_LIMIT="1")
         return subprocess.run([str(nvdisasm), str(cubin)], env=env, capture_output=True, check=True,
@@ -302,8 +365,17 @@ def build(out: Path, cache: Path, cc: list[str], crt: Path | None) -> None:
         nvdisasm = fixed_base(nvdisasm)
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
+        if DARWIN and not os.environ.get("ZIG_GLOBAL_CACHE_DIR"):
+            zcache = work / "zig-cache"
+            zcache.mkdir(parents=True, exist_ok=True)
+            os.environ["ZIG_GLOBAL_CACHE_DIR"] = os.environ["ZIG_LOCAL_CACHE_DIR"] = str(zcache)
         (work / "k.ptx").write_text(PTX)
-        subprocess.run([str(ptxas), "-arch=sm_86", str(work / "k.ptx"), "-o", str(work / "sm_86.cubin")], check=True)
+        if DARWIN:
+            ptxas_cmd, ptxas_env = _blink_cmd(ptxas)
+            subprocess.run([*ptxas_cmd, "-arch=sm_86", str(work / "k.ptx"), "-o", str(work / "sm_86.cubin")],
+                           env=ptxas_env, check=True)
+        else:
+            subprocess.run([str(ptxas), "-arch=sm_86", str(work / "k.ptx"), "-o", str(work / "sm_86.cubin")], check=True)
         lib = intercept_lib(cc, work, crt)
         # A garbled capture is still possible (see no_aslr and fixed_base) and the parser has caught every one: a few
         # tries, ~3 s each.
@@ -334,6 +406,13 @@ def default_cc() -> str:
         clang = ROOT / "build/win/llvm-mingw/bin/x86_64-w64-mingw32-clang.exe"
         if clang.exists():
             return json.dumps([clang.as_posix()])
+    if DARWIN:
+        for zig in (ROOT.parent / "zig/zig", ROOT / "build/macos-cache/zig-universal/zig"):
+            if zig.is_file() and (zig.parent / "lib/std/std.zig").is_file():
+                os.environ.setdefault("ZIG_LIB_DIR", str(zig.parent / "lib"))
+                return json.dumps([str(zig), "cc", "-target", "x86_64-linux-gnu"])
+        if shutil.which("zig"):
+            return json.dumps(["zig", "cc", "-target", "x86_64-linux-gnu"])
     return "cc"
 
 

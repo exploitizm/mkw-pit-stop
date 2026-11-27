@@ -170,10 +170,12 @@ def windows_memory_gb() -> tuple[float, float]:
 
 
 def mem_total_gb() -> float:
-    """The machine's memory in GiB, for the job counts (build.py --job-mem-gb, prepare.py fit). Windows has no
-    /proc/meminfo."""
+    """The machine's memory in GiB, for the job counts (build.py --job-mem-gb, prepare.py fit). Windows and macOS
+    have no /proc/meminfo."""
     if os.name == "nt":
         return windows_memory_gb()[0]
+    if sys.platform == "darwin":
+        return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"])) / 1024**3
     with open("/proc/meminfo") as f:
         for line in f:
             if line.startswith("MemTotal:"):

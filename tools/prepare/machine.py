@@ -7,6 +7,8 @@ Why apart: prepare.py holds the steps; this is what they run with. Not run on it
 import faulthandler
 import json
 import os
+import platform
+import re
 import subprocess
 import sys
 import time
@@ -15,6 +17,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools/build"))
 import build  # (mem_total_gb, windows_memory_gb)
+
+DARWIN = sys.platform == "darwin"
 
 
 # Seconds without an event before logs/setup.log gets every thread's Python stack (prepare.py sets it once the log is
@@ -57,6 +61,10 @@ def package_dir(game: Path) -> Path:
 
 def default_cc(game: Path, target: str) -> list[str]:
     zig = package_dir(game) / "zig" / ("zig.exe" if os.name == "nt" else "zig")
+    if not zig.is_file() and DARWIN:
+        dev_zig = Path(__file__).resolve().parents[2] / "build/macos-cache/zig-universal/zig"
+        if dev_zig.is_file():
+            zig = dev_zig
     if zig.is_file():
         # zig finds its lib/ from the path it reads as its own executable (/proc/self/exe); when that path is not the
         # package's (a launcher or sandbox that copies or wraps the binary) every zig cc fails with "unable to find zig
@@ -66,7 +74,13 @@ def default_cc(game: Path, target: str) -> list[str]:
             raise Failed(f"{lib} is incomplete: extract the release again")
         os.environ["ZIG_LIB_DIR"] = str(lib)
         use_own_zig_cache(game)
-        return [str(zig), "cc", "-target", "x86_64-windows-gnu" if target == "windows" else f"{build.ARCH}-linux-gnu"]
+        if target == "windows":
+            triple = "x86_64-windows-gnu"
+        elif DARWIN and target == "linux":
+            triple = "x86_64-linux-gnu"
+        else:
+            triple = f"{build.ARCH}-linux-gnu"
+        return [str(zig), "cc", "-target", triple]
     return ["clang"]
 
 
@@ -112,7 +126,13 @@ def crt_link(game: Path, cc: list[str], lib: Path, out: Path, obj: Path, inputs:
 
 
 def default_glslc(game: Path) -> str:
-    base = package_dir(game) / "glslc"
+    pkg = package_dir(game)
+    if DARWIN:
+        arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
+        arch_exe = pkg / "arch" / arch / "glslc/bin/glslc"
+        if arch_exe.is_file():
+            return str(arch_exe)
+    base = pkg / "glslc"
     exe = base / ("glslc.exe" if os.name == "nt" else "bin/glslc")
     return str(exe) if exe.is_file() else "glslc"
 
@@ -122,7 +142,8 @@ def tool_env(glslc: str) -> dict[str, str]:
     env = dict(os.environ)
     lib = Path(glslc).parent.parent / "lib"
     if os.name != "nt" and lib.is_dir():
-        env["LD_LIBRARY_PATH"] = f"{lib}:{env['LD_LIBRARY_PATH']}" if env.get("LD_LIBRARY_PATH") else str(lib)
+        var = "DYLD_LIBRARY_PATH" if DARWIN else "LD_LIBRARY_PATH"
+        env[var] = f"{lib}:{env[var]}" if env.get(var) else str(lib)
     return env
 
 
@@ -214,11 +235,26 @@ def children_cpu() -> float:
 
 
 def mem_available_gb() -> float:
-    """Memory free for new work now (MemAvailable on Linux, ullAvailPhys on Windows); 8 when unknown."""
+    """Memory free for new work now (MemAvailable on Linux, vm_stat on macOS, ullAvailPhys on Windows); 8 when unknown."""
     if os.name == "nt":
         try:
             return build.windows_memory_gb()[1]
         except OSError:
+            return 8.0
+    if DARWIN:
+        try:
+            out = subprocess.check_output(["vm_stat"], text=True)
+            m_page = re.search(r"page size of (\d+) bytes", out)
+            page_sz = int(m_page.group(1)) if m_page else 16384
+            pages = 0
+            for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+                m = re.search(rf"^{key}:\s+(\d+)\.", out, re.M)
+                if m:
+                    pages += int(m.group(1))
+            if pages:
+                return pages * page_sz / 2**30
+            return build.mem_total_gb() * 0.6
+        except (OSError, ValueError):
             return 8.0
     try:
         with open("/proc/meminfo") as f:

@@ -30,6 +30,8 @@ import contextlib
 import hashlib
 import json
 import os
+import platform
+import plistlib
 import shutil
 import struct
 import subprocess
@@ -202,10 +204,13 @@ def find_bundle(bundle_arg: Path | None) -> Path:
 
 def find_zig(bundle: Path) -> Path | None:
     exe = "zig.exe" if os.name == "nt" else "zig"
+    arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
     for cand in (
         bundle / "bin" / exe,
         PKG_DIR / "setup/zig" / exe,
+        PKG_DIR / "setup/arch" / arch / "zig" / exe,
         ROOT / "setup/zig" / exe,
+        ROOT / "build/macos-cache/zig-universal" / exe,
         bundle.parent / "zig" / exe,
         Path(shutil.which("zig") or ""),
     ):
@@ -595,8 +600,12 @@ def link_ps5_eboot(layout: dict, rt_obj: Path, extra_objs: list[Path], work: Pat
 
 # ---- shader reuse + setup state
 
-def find_existing_spec(shader_cache: Path | None, bundle: Path) -> Path | None:
+def find_existing_spec(shader_cache: Path | None, bundle: Path, work: Path | None = None) -> Path | None:
     candidates = [ROOT / "build/sm86/instructions.json", ROOT / "sm86/instructions.json"]
+    if work:
+        candidates.append(work / "sm86/instructions.json")
+    if sys.platform == "darwin":
+        candidates.append(Path.home() / "Library/Application Support/Mario Kart World Pit Stop/sm86/instructions.json")
     if shader_cache:
         candidates.append(shader_cache.parent / "sm86/instructions.json")
     candidates.append(bundle.parent / "sm86/instructions.json")
@@ -691,7 +700,25 @@ USB_MIRRORED = ("spirv", "exefs")
 
 
 def drive_filesystem(path: Path) -> str:
-    """The file system of the drive holding path ("exFAT", "FAT32", "NTFS"...), on Windows; "" elsewhere or unknown."""
+    """The file system of the drive holding path ("exFAT", "FAT32", "NTFS", "APFS"...); "" if unknown."""
+    if sys.platform == "darwin":
+        r = subprocess.run(["diskutil", "info", "-plist", str(path.resolve())],
+                           capture_output=True, check=False)
+        if r.returncode:
+            return ""
+        try:
+            info_plist = plistlib.loads(r.stdout)
+        except Exception:
+            return ""
+        fs = str(info_plist.get("FilesystemType") or info_plist.get("FileSystemType") or "").lower()
+        return {
+            "exfat": "exFAT",
+            "msdos": "FAT32",
+            "fat32": "FAT32",
+            "apfs": "APFS",
+            "hfs": "HFS+",
+            "ntfs": "NTFS",
+        }.get(fs, fs.upper() if fs else "")
     if os.name != "nt":
         return ""
     import ctypes
@@ -939,6 +966,12 @@ def main() -> int:
         work = out_dir.with_name(f"{TITLE_ID}.work")
 
     work.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "darwin" and not os.environ.get("SSL_CERT_FILE") and Path("/etc/ssl/cert.pem").is_file():
+        os.environ["SSL_CERT_FILE"] = "/etc/ssl/cert.pem"
+    if not os.environ.get("ZIG_GLOBAL_CACHE_DIR"):
+        zig_cache = work / "zig-cache"
+        zig_cache.mkdir(parents=True, exist_ok=True)
+        os.environ["ZIG_GLOBAL_CACHE_DIR"] = os.environ["ZIG_LOCAL_CACHE_DIR"] = str(zig_cache)
     log_path = args.log.resolve() if args.log else (work / "setup.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     sys.stderr = open(log_path, "w", encoding="utf-8", buffering=1)  # noqa: SIM115
@@ -1113,10 +1146,14 @@ def main() -> int:
             emit("skip", "shaders")
         else:
             emit("step", "shaders")
-            spec = find_existing_spec(args.shader_cache, bundle)
+            spec = find_existing_spec(args.shader_cache, bundle, work)
             if spec is None:
                 host_target = "windows" if os.name == "nt" else "linux"
-                host_cc = default_cc(tools_root, host_target)
+                zig = find_zig(bundle)
+                if sys.platform == "darwin" and zig:
+                    host_cc = [str(zig), "cc", "-target", "x86_64-linux-gnu"]
+                else:
+                    host_cc = default_cc(tools_root, host_target)
                 spec = sm86_spec(work, work, host_cc)
             copied = seed_shader_cache(args.shader_cache, out_dir / "spirv")
             if copied:

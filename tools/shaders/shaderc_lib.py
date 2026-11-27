@@ -11,6 +11,7 @@ Usage: comp = Shaderc.near(glslc_path); spv, err = comp.compile(src, "ps", "name
 import ctypes
 import ctypes.util
 import os
+import sys
 from pathlib import Path
 
 # shaderc.h shaderc_shader_kind (printed from the header: task and mesh come after the ray tracing kinds)
@@ -38,12 +39,24 @@ def find(glslc: str) -> str | None:
     """The library that goes with this glslc: beside the package's, else the system's."""
     if os.sep in glslc or "/" in glslc:
         exe = Path(glslc)
-        for lib in (exe.parent / "shaderc.dll", exe.parent.parent / "lib/libshaderc.so.1",
-                    exe.parent.parent / "lib/libshaderc_shared.so.1"):  # fmt: skip
+        for lib in (
+            exe.parent / "shaderc.dll",
+            exe.parent.parent / "lib/libshaderc.so.1",
+            exe.parent.parent / "lib/libshaderc_shared.so.1",
+            exe.parent.parent / "lib/libshaderc_shared.1.dylib",
+            exe.parent.parent / "lib/libshaderc_shared.dylib",
+            exe.parent.parent / "lib/libshaderc.1.dylib",
+            exe.parent.parent / "lib/libshaderc.dylib",
+        ):
             if lib.is_file():
                 return str(lib)
         return None  # a glslc of its own (a test's stand-in): no library of the system behind its back
-    return ctypes.util.find_library("shaderc_shared")
+    found = ctypes.util.find_library("shaderc_shared")
+    if not found and sys.platform == "darwin":
+        for cand in ("/opt/homebrew/lib/libshaderc_shared.dylib", "/usr/local/lib/libshaderc_shared.dylib"):
+            if Path(cand).is_file():
+                return cand
+    return found
 
 
 class Shaderc:

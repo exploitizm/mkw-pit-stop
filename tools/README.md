@@ -21,6 +21,7 @@ default, or `MKW_GAME=<dir>`, with `exefs/` and `romfs/` inside) and write to `b
 | [mod/](mod/README.md) | Mod import for the start screen's Mods page (started by it the same way) |
 | [plugin/](plugin/README.md) | The native plugin API's test and its example plugin |
 | [ps5/](ps5/README.md) | Mario Kart World: Pit Stop (`PPSA99193`), the game-free PS5 Vulkan smoke title (`PPSA99192`), console deployment and PS5 release packaging |
+| [macos/](macos/README.md) | Universal macOS (`arm64` + `x86_64`) packaging of the PS5 builder: self-bootstrapping `.app`/`.dmg` build and the SwiftUI front end |
 | [run/](run/README.md) | Game runs (live with a control channel, to the race, under perf) and diagnostics: stacks, memory |
 | [test/](test/README.md) | Runtime tests without the game: frame captures replayed serially and in chunks |
 | [shaders/](shaders/README.md) | Extraction of the GPU programs, SM86 opcode census and translation to SPIR-V |
