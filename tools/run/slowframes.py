@@ -22,7 +22,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 TICK = 1000 / 60  # ms of a 60 fps frame
-SLOW = re.compile(r"perf: slow frame (\d+): ([\d.]+) ms; blocked (.*?)(?:; costs ms:(.*))?$")
+SLOW = re.compile(r"perf: slow frame (\d+): ([\d.]+) ms; blocked (.*?)(?:; costs ms:(.*?))?(?:; ab=([AB]))?$")
+ABWIN = re.compile(r"interval avg .*; ab (\d+)/(\d+);")  # the 60-frame perf line: B frames of the window
 WINDOW = re.compile(r"perf: frame (\d+): costs ms/f:(.*)$")
 TRACE = re.compile(r"frame: period ([\d.]+) call [\d.]+ meas [\d.]+ cpu ([\d.]+) ts (-?[\d.]+)")
 RESULT = re.compile(
@@ -74,6 +75,24 @@ def classify(
     return ("unexplained, GPU tail" if ts > GPU_TAIL_MS else "unexplained, game CPU"), 0.0
 
 
+def ab_report(rows: list[tuple], ab_of: dict[int, str], frames: dict[str, int]) -> None:
+    """MKW_AB with a switch at "ab": each block's lows from its own slowest frames (the 1 % low is the frame time 99 %
+    of the block's frames stay under, as bench.c computes it), and what its 1 % set is made of."""
+    print("\nA/B blocks (MKW_AB): lows from each block's own frames")
+    for blk in "AB":
+        n = frames[blk]
+        ms = sorted((r[1] for r in rows if ab_of.get(r[0]) == blk), reverse=True)
+        k1, k01 = n // 100, n // 1000
+        low = lambda k: f"{1000 / ms[k]:.1f} fps ({ms[k]:.1f} ms)" if k < len(ms) else "over every slow line"
+        sel = sorted((r for r in rows if ab_of.get(r[0]) == blk), key=lambda r: -r[1])[: max(k1, 1)]
+        causes = Counter(r[2].split(" > ")[0] for r in sel).most_common(4)
+        print(
+            f"  {blk}: {n} frames, 1% low {low(k1)}, 0.1% low {low(k01)}, over 33.3 ms {sum(1 for x in ms if x > 33.4)}, "
+            f"over 50 ms {sum(1 for x in ms if x > 50)}; 1% set by first cause: "
+            + ", ".join(f"{c} {k}" for c, k in causes)
+        )
+
+
 def pct(xs: list[float], q: float) -> float:
     return sorted(xs)[min(len(xs) - 1, int(q * len(xs)))]
 
@@ -92,6 +111,8 @@ def main() -> None:
         tail = args.log.read_text(errors="replace").splitlines()
         result = next((m for ln in tail if (m := RESULT.search(ln))), None)
     periods, slow, windows = [], [], []
+    ab_frames = {"A": 0, "B": 0}
+    ab_of: dict[int, str] = {}
     last_ts = None
     for ln in lines:
         if m := TRACE.search(ln):
@@ -99,8 +120,13 @@ def main() -> None:
             last_ts = float(m[3])
         elif m := SLOW.search(ln):
             slow.append((int(m[1]), float(m[2]), pairs(m[3]), pairs(m[4]), last_ts))
+            if m[5]:
+                ab_of[int(m[1])] = m[5]
         elif m := WINDOW.search(ln):
             windows.append(pairs(m[2]))
+        if m := ABWIN.search(ln):
+            ab_frames["B"] += int(m[1])
+            ab_frames["A"] += int(m[2]) - int(m[1])
     if not slow:
         sys.exit("no 'perf: slow frame' lines in the race: run with MKW_TRACE=perf and MKW_PERF_SLOW_MS=20")
 
@@ -197,6 +223,9 @@ def main() -> None:
                 f"  frames {run[0][0]}-{run[-1][0]}: {len(run)} slow, {sum(r[1] - TICK for r in run):6.0f} ms over, "
                 f"worst {max(r[1] for r in run):.1f} ms, mostly {top}"
             )
+
+    if ab_frames["B"] and "B" in ab_of.values():
+        ab_report(rows, ab_of, ab_frames)
 
     if args.frames:
         print("\nframe      ms  cause (its growth over normal), costs, render blocked, ts")
