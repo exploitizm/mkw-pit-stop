@@ -374,6 +374,7 @@ static const CfgRow rows[] = {
     K("POOL_LOG"),
     K("POOL_RELEASE"),
     K("POOL_SPILL"),
+    K("PRECHECK_PAR"),
     K("PRECHECK_YIELD"),
     K("PROBE"),
     K("PROFILE"),

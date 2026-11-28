@@ -115,6 +115,7 @@ extern PlatMutex owned_lock;
 extern Tex **owned;
 extern int nowned, cowned;
 extern uint64_t max_owned, gpu_writes, n_checks;
+int tex_snap_scoped(void);   // MKW_SNAP_SCOPED on now (vk_tex_upload.c)
 extern uint32_t agen[AGEN_N];
 extern uint64_t *sinfo, *schk;
 void tex_init(void *p);

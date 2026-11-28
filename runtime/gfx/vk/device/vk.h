@@ -244,6 +244,7 @@ extern uint32_t vk_tex_reg_limit;
 void vk_sampler_register(int id, const samp_par *s);                // sampler descriptor slot (copied)
 uint64_t vk_texture_trim_gov(uint64_t bytes);   // the governor's: idle longer, oldest first, the lock released between batches
 uint64_t vk_texture_trim(uint64_t bytes);      // out of memory: released and idle mirrored textures go (vk_staging)
+int vk_texture_precheck_par(const uint32_t *ids, int n, uint32_t ep);   // MKW_PRECHECK_PAR, tex_lock held: slots checked
 uint64_t vk_texture_trim_released(uint64_t keep_bytes); // shed released-texture cache down to keep_bytes
 void vk_texture_release(const tex_t *t);   // TextureFinalize: the image stays for slots that still name its storage
 void vk_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row, uint64_t img);
@@ -429,6 +430,7 @@ int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
 int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch, uint32_t *now);
 // MKW_SNAP_SCOPED: the same answer from the range's own pages (a peek; a query of the range only if it may be written).
 int vk_mem_changed_scoped(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
+int vk_mem_changed_peek(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);   // read-only; -2: the full check
 // After vk_mem_changed / vk_mem_changed_snap reported a texture's storage written, tests each [base+offs[i], +sizes[i])
 // against the page generation table (no OS write-watch query) so re-uploads only deswizzle and copy dirty subresources.
 void vk_mem_ranges_written_since(uint64_t base, const uint64_t *offs, const uint64_t *sizes, uint8_t *dirty, uint32_t n,
