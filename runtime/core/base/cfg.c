@@ -155,7 +155,7 @@ static const CfgRow rows[] = {
     S("REPLAY_PAR", "performance", REPLAY_PAR_DEFAULT, "0|1|2", RESTART),
     S("PACK", NULL, "0", "0|1", RESTART),   // PS5 (on in its profile): cold guest memory compressed (vk_mem_upload.c pack_step)
     S("PACK_TEXFREE", NULL, "0", "0|1", RESTART),   // PS5 (on in its profile, with PACK): the texture heap's free blocks packed first (vk_mem_upload.c texfree_pack)
-    S("PACK_BACKOFF", NULL, "1", "0|1", RESTART),   // MKW_PACK: a unit read back waits twice as long before the next pack
+    S("PACK_BACKOFF", NULL, "1", "0|1|2", RESTART),   // MKW_PACK: a unit read back waits twice as long before the next pack; 2: is never packed again
     S("FREE_CORES", "performance", "0", "0|1", RESTART),
     S("TIMER_1MS", "performance", "1", "0|1", RESTART),
     // shaders and pipelines
@@ -270,6 +270,7 @@ static const CfgRow rows[] = {
     K("CRIT"),
     K("CRIT_OUT"),
     K("CTL"),
+    K("DECOMMIT_RUN"),
     K("DISCORD_APP"),
     K("DLSSG_DISABLE_BUF"),
     K("DLSSG_EXP"),
@@ -312,6 +313,7 @@ static const CfgRow rows[] = {
     K("FG_TEST"),
     K("FG_VBLANK"),
     K("FG_XWAIT"),
+    K("FILL_WINDOW"),
     K("FLIGHT_AT"),
     K("FLIGHT_DIR"),
     K("FLIGHT_FRAMES"),
@@ -347,6 +349,8 @@ static const CfgRow rows[] = {
     K("LIST_WATCH"),
     K("LOCALE"),
     K("LOGIC_HZ_TT"),
+    K("MAP_PROBE"),
+    K("MEMCPY_HOLD"),
     K("MENU_TEST"),
     K("MENU_TEST_DIR"),
     K("MENU_TEST_SET"),
@@ -373,6 +377,7 @@ static const CfgRow rows[] = {
     K("POOL_LOG"),
     K("POOL_RELEASE"),
     K("POOL_SPILL"),
+    K("PRECHECK_PAR"),
     K("PRECHECK_YIELD"),
     K("PROBE"),
     K("PROFILE"),
@@ -449,6 +454,7 @@ static const CfgRow rows[] = {
     K("SPIN"),
     K("SPIN_HANDOFF_US"),
     K("SPIRV_RELEASE"),
+    K("STALL_TRACE"),
     K("STEAM_X11"),
     K("SVC_STATS"),
     K("SWKBD_ANSWER"),
@@ -477,9 +483,13 @@ static const CfgRow rows[] = {
     K("TEX_UP_LOG"),
     K("TEX_UP_LOG_AT"),
     K("TEX_ZERO_LOG"),
+    K("THAW_FAST"),
     K("TRACE_UBO"),
     K("TRACE_UBO_OUT"),
     K("UBO_SNAPSHOT"),
+    K("UNMAP_DEFER"),
+    K("UNMAP_SLICE"),
+    K("UNPACK_BATCH"),
     K("UPDATE_AS"),
     K("UPDATE_REPO"),
     K("USNAP_ASYNC"),
@@ -500,6 +510,7 @@ static const CfgRow rows[] = {
     K("WB_PAR"),
     K("YIELD_NOLOCK"),
     K("YIELD_PAUSE"),
+    K("ZERO_POOL"),
     K("ZERO_SCAN_CACHE"),
 };
 #define N_ROWS (sizeof rows / sizeof *rows)
@@ -727,6 +738,39 @@ static const struct { const char *key, *value; } PS5[] = {
     // 99.6 % of a 1.8.0 race's re-uploads (2,789 of 2,801, 678 MiB in 1,800 frames; reup-ab1), the write watch flagging
     // pages whose texture bytes did not change. In-race A/B: frame -0.11 / -0.49 ms, busy -0.10 / -0.91 (25/11/2026).
     {"REUP_SAME", "1"},
+    // Large guest memcpy/memset destinations held writable in runs before the copy instead of a write-watch fault per
+    // 64 KiB (nvn_api_core.c guest_write_hold): in-race A/B, two 1.8.0 Grand Prix (hold-ab / hold-inv, 28/11/2026),
+    // 1 % low 37.9 -> 40.5 and 36.5 -> 42.6 fps, 0.1 % low 21.0 -> 20.4 and 15.9 -> 29.2 fps, frame -0.10 ms balanced;
+    // the write-watch fault storms behind the 1 % low's page-protection frames left B's slowest frames.
+    {"MEMCPY_HOLD", "1"},
+    // The replay's precheck peeks its clean texture slots in parallel on the ASTC pool (vk_tex_slots.c
+    // vk_texture_precheck_par): in-race A/B, two 1.8.0 Grand Prix (pp-ab0 / pp-ab1, 28/11/2026), ~2,100 slots a frame,
+    // 1 % low 39.5 -> 41.3 and 38.3 -> 42.0 fps, frames over 20 ms 4.1 -> 2.7 % and 3.5 -> 3.2 %, frame unchanged; a
+    // race watched by the user with it on showed no stale texture.
+    {"PRECHECK_PAR", "1"},
+    // A unit's backing (an unpack, a fresh commit) makes its page protections in one batch (ps5_guest_memory.c
+    // back_unit_locked): in-race A/B, two 1.8.0 Grand Prix (ub-ab0 / ub-ab1, 28/11/2026), the slow frames' backing time
+    // outside the commits' own steps 254 -> 71 and 435 -> 52 ms, 1 % low 42.0 -> 43.5 and 40.7 -> 44.2 fps, frames
+    // over 33.3 ms 12 -> 14 and 20 -> 6, frame unchanged.
+    {"UNPACK_BATCH", "1"},
+    // The game's UnmapPhysicalMemory releases its pages on the "unmap" thread (memory.c unmap_defer): its 20-21 MiB pools
+    // took 56-61 ms each to unmap on its own thread (churn1, 28/11/2026). In-race A/B, two 1.8.0 Grand Prix (ud-ab0 /
+    // ud-ab1): 1 % low 40.5 -> 42.7 and 41.8 -> 43.3 fps, 0.1 % low 19.1 -> 22.6 and 17.1 -> 25.1 fps, frames over 50 ms
+    // 6 -> 3 and 5 -> 2, frame unchanged; races watched by the user looked clean.
+    {"UNMAP_DEFER", "1"},
+    // Decommits release whole units up to 32 in a row with one unmap (ps5_guest_memory.c decommit_units): each unmap
+    // costs ~42 us on the console (MKW_MAP_PROBE), and the unmap thread held frz_lock ~47 ms over the game's 21 MiB
+    // pools. Five 150 s 1.8.0 Grand Prix against six without (dr_* / zp0_*, 28/11/2026): frames over 50 ms 2-6 (mean
+    // 4.2) against 5-9 (7.2), 0.1 % low 22.1-26.2 against 19.5-22.9 fps, no slow thaw or MapPhysicalMemory left; races
+    // watched by the user looked clean.
+    {"DECOMMIT_RUN", "1"},
+    // Units' first contents (unpacks, fresh zeros) are written through one shared window unmapped once per 32 units
+    // instead of a private map each (ps5_memory.c fill_window): the unpack frames carried ~17 ms of private maps beside
+    // their decompression. Three 150 s 1.8.0 Grand Prix with DECOMMIT_RUN (drf_*, 28/11/2026): frames over 50 ms 2 / 4
+    // / 1 against 2-6 with DECOMMIT_RUN alone, 1 % low 43.9-44.7 against 39.6-44.8, 0.1 % low 26.0-27.7. The user
+    // watched all three in PXPlay: two clean, a couple of black texture flashes in drf_2 (none in the DECOMMIT_RUN-only
+    // runs around it); added at the user's request, 28/11/2026.
+    {"FILL_WINDOW", "1"},
     // The console's own controller: PlayStation icons rather than auto, which guesses from the pad's labels (Xbox when
     // it reports none), and the DualSense's vibration at 100 % (the table's 130 % suits PC pads; asked for by the user,
     // 24/11/2026). Both stay in Pit Stop > Controls.

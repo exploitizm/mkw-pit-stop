@@ -60,10 +60,29 @@ void nvn_guest_written(uint64_t addr, uint64_t size) {
 // memcpy of pool storage the GPU rendered into must copy what the GPU wrote: TotK moves its generated grass maps
 // between pools with memcpy. Copies below 1 KiB skip the check; the copy itself is memmove, as overlapping
 // arguments are undefined for memcpy anyway.
+// MKW_MEMCPY_HOLD (default 0, 1 in the PS5 profile: cfg.c has the A/B; "ab" to compare): a copy or fill of MEMCPY_HOLD_MIN bytes or more holds
+// its destination first (plat_mem_back_hold_as: the units it needs backed, a packed one unpacked, in one pass, and the
+// write watch's armed pages made writable with one protection call per run of adjacent pages), instead of a fault on
+// every 64 KiB the stores reach (prot_watch_fault, batched 4 pages at most: more overshot the write and re-uploaded
+// textures for nothing). Fault storms of 28/11/2026 (storm bench, 1.8.0 GP): 60-95 % of the faults of every frame with
+// 64 or more came from libc's copy behind this override, sequential runs over 4-5 2 MiB regions (8-10 MiB) about every
+// 4 frames, 130-374 faults in the frames of the 1 % low at 40-90 us each, with the packed units' unpacks in the same
+// frames. The pages end up written as the faults would leave them; the range is exact, so nothing more is marked.
+#define MEMCPY_HOLD_MIN (64u << 10)
+static int guest_write_hold(uint64_t dst, uint64_t n) {
+    static int mode = -1;
+    if (n < MEMCPY_HOLD_MIN) return 0;
+    int m = __atomic_load_n(&mode, __ATOMIC_RELAXED);
+    if (m < 0) __atomic_store_n(&mode, m = rt_knob("MEMCPY_HOLD", "0"), __ATOMIC_RELAXED);
+    return RT_KNOB_ON(m) && plat_mem_back_hold_as(dst, (size_t)n, PLAT_BACK_WRITE_FAULT);
+}
+
 static void ov_memcpy(Cpu *c) {
     uint64_t dst = arg_x(c, 0), src = arg_x(c, 1), n = arg_x(c, 2);
     if (n >= 1024) gfx_backend()->guest_read(src, n);
+    int held = guest_write_hold(dst, n);
     memmove((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n);
+    if (held) plat_mem_back_release(dst, (size_t)n);
     ret_x(c, dst);
 }
 HOST_OVERRIDE("memcpy", ov_memcpy);
@@ -76,8 +95,10 @@ HOST_OVERRIDE("memcpy", ov_memcpy);
 // unit for any faulting rip; Linux: userfaultfd write protection; Windows: MEM_WRITE_WATCH). memset reads no guest
 // bytes, so there is no guest_read as in memcpy. Called through every module's PLT (main, sdk, subsdk0).
 void ov_memset_host(Cpu *c) {
-    uint64_t dst = arg_x(c, 0);
-    memset((void *)(uintptr_t)dst, (int)(uint8_t)arg_x(c, 1), (size_t)arg_x(c, 2));
+    uint64_t dst = arg_x(c, 0), n = arg_x(c, 2);
+    int held = guest_write_hold(dst, n);   // (MKW_MEMCPY_HOLD, above)
+    memset((void *)(uintptr_t)dst, (int)(uint8_t)arg_x(c, 1), (size_t)n);
+    if (held) plat_mem_back_release(dst, (size_t)n);
     ret_x(c, dst);
 }
 // MKW_HOST_MEMSET (default 1; "ab" to compare in one run; 0: the game's own through rt_original): an observer rather
@@ -637,6 +658,7 @@ static void sync_wait_note(uint64_t fence, uint64_t ns, uint64_t issued_at_start
     static uint64_t n[4], t[4], total;
     int k = nvn_fence_frame_rel(fence);
     __atomic_fetch_add(&n[k], 1, __ATOMIC_RELAXED), __atomic_fetch_add(&t[k], ns, __ATOMIC_RELAXED);
+    perf_ledger(fence > issued_at_start ? PERF_LG_SYNC_REPLAY : PERF_LG_SYNC_GPU, ns);
     if (fence > issued_at_start) __atomic_fetch_add(&sw_rep_n, 1, __ATOMIC_RELAXED), __atomic_fetch_add(&sw_rep_ns, ns, __ATOMIC_RELAXED);
     else __atomic_fetch_add(&sw_gpu_n, 1, __ATOMIC_RELAXED), __atomic_fetch_add(&sw_gpu_ns, ns, __ATOMIC_RELAXED);
     if (__atomic_add_fetch(&total, 1, __ATOMIC_RELAXED) % 600) return;

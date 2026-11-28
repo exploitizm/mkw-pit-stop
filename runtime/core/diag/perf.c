@@ -111,6 +111,68 @@ void perf_replay(uint64_t t0) {
     if (__atomic_load_n(&perf_on, __ATOMIC_RELAXED)) plat_add64(&replay_ns, d);
 }
 
+// The per-frame cost ledger (host.h), read and reset at each present. A cost is charged to the present that follows
+// it: with the game a frame ahead of the replay, a slow frame's ledger holds the game's next frame and the replay of
+// its own, which is what ran in its period.
+static volatile int64_t ledger[PERF_LG_N];
+static const char *const ledger_name[PERF_LG_N] = {"sync_replay", "sync_gpu",   "texlock",       "upload",
+                                                   "astc",        "precheck",   "early",         "gov",
+                                                   "capture",     "sparse",     "replay_walk",   "replay_chunks",
+                                                   "draws_n"};
+
+void perf_ledger(int kind, uint64_t ns) {
+    if (ns && __atomic_load_n(&perf_on, __ATOMIC_RELAXED)) plat_add64(&ledger[kind], (int64_t)ns);
+}
+
+// The ledger since the last present, with the replay's time (rep_ns) and the platform's page protection and PACK
+// unpacks (running totals, differenced here), into out as " name ms" pairs (under 0.05 ms left out); resets it and adds
+// it to the window's sums, which ledger_window prints every 60 presents as the normal frame's costs.
+enum { LG_REPLAY = PERF_LG_N, LG_PLAT, LG_ALL = LG_PLAT + PLAT_MEM_COST_N };
+static uint64_t lg_win[LG_ALL];
+
+static void ledger_fmt(char *out, size_t cap, const uint64_t *ns, double div) {
+    static const char *const extra[LG_ALL - PERF_LG_N] = {
+        "replay",     "prot_fault",  "prot_arm",  "prot_hold",  "prot_change", "prot_early", "unpack",
+        "prot_calls", "back_alloc",  "back_map",  "back_fill",  "back_fixed",  "back_fresh", "back_fresh_n",
+        "back_total"};
+    size_t o = 0;
+    out[0] = 0;
+    for (int i = 0; i < LG_ALL && o < cap; i++) {
+        int count = i == LG_PLAT + PLAT_MEM_COST_PROT_CALLS || i == LG_PLAT + PLAT_MEM_COST_BACK_FRESH_N ||
+                    i == PERF_LG_DRAWS;   // a count, not ns
+        double ms = (double)ns[i] / (count ? 1.0 : 1e6) / div;
+        if (ms >= 0.05) o += (size_t)snprintf(out + o, cap - o, " %s %.2f", i < PERF_LG_N ? ledger_name[i] : extra[i - PERF_LG_N], ms);
+    }
+}
+
+static void ledger_take(char *out, size_t cap, uint64_t rep_ns) {
+    static uint64_t plat_prev[PLAT_MEM_COST_N];
+    uint64_t pc[PLAT_MEM_COST_N] = {0}, ns[LG_ALL];
+    plat_mem_cost_ns(pc);
+    for (int i = 0; i < PERF_LG_N; i++) ns[i] = (uint64_t)plat_xchg64(&ledger[i], 0);
+    ns[LG_REPLAY] = rep_ns;
+    for (int i = 0; i < PLAT_MEM_COST_N; i++) ns[LG_PLAT + i] = pc[i] - plat_prev[i];
+    memcpy(plat_prev, pc, sizeof pc);
+    for (int i = 0; i < LG_ALL; i++) lg_win[i] += ns[i];
+    ledger_fmt(out, cap, ns, 1);
+}
+
+static void ledger_window(uint64_t frame, uint64_t n) {
+    char b[768];
+    ledger_fmt(b, sizeof b, lg_win, (double)n);
+    uint64_t tf_s = 0, tf_l = 0, ud = 0, ur = 0, zp[7];
+    mem_thaw_wb_stats(&tf_s, &tf_l);
+    mem_unmap_defer_stats(&ud, &ur);
+    plat_mem_zero_pool_stats(zp);
+    rt_log("perf: frame %llu: costs ms/f:%s; write-back thaws skipped %llu, locked %llu (MKW_THAW_FAST); unmaps deferred "
+           "%llu, drained by a map %llu (MKW_UNMAP_DEFER); zero pool: taken %llu zeroed + %llu not, missed %llu, "
+           "recycled %llu, zeroed %llu, ready %llu + %llu (MKW_ZERO_POOL)", (unsigned long long)frame, b,
+           (unsigned long long)tf_s, (unsigned long long)tf_l, (unsigned long long)ud, (unsigned long long)ur,
+           (unsigned long long)zp[0], (unsigned long long)zp[1], (unsigned long long)zp[2], (unsigned long long)zp[3],
+           (unsigned long long)zp[4], (unsigned long long)zp[5], (unsigned long long)zp[6]);
+    memset(lg_win, 0, sizeof lg_win);
+}
+
 static volatile int64_t counts[PERF_CNT_N];   // running totals: the perf log and the flight recorder take differences
 
 void perf_count(int kind) {
@@ -463,6 +525,74 @@ static void pw_fault_batch_placement(void) {
     applied = on;
 }
 
+// MKW_UNPACK_BATCH (default 0, 1 in the PS5 profile: cfg.c has the A/B; "ab"): a unit's backing makes its page protections in one batch (ps5_guest_memory.c).
+static void unpack_batch_placement(void) {
+    static int mode = -1, applied = -1;
+    if (mode < 0) {
+        mode = rt_knob("UNPACK_BATCH", "0");
+        if (mode && plat_mem_unpack_batch_mode(0) < 0) mode = 0, applied = 0;
+        else if (mode) rt_log("mem: unit backings protect in one batch %s (MKW_UNPACK_BATCH)", mode == 2 ? "in the B blocks" : "on");
+    }
+    int on = RT_KNOB_ON(mode);
+    if (on == applied) return;
+    plat_mem_unpack_batch_mode(on);
+    applied = on;
+}
+
+// MKW_ZERO_POOL (default 0 until measured, "ab"): released direct-memory units are kept and zeroed on a thread of
+// their own, and fresh unit commits take one (ps5_memory.c): the race's 600-700-unit frames of pool churn.
+static void zero_pool_placement(void) {
+    static int mode = -1, applied = -1;
+    if (mode < 0) {
+        mode = rt_knob("ZERO_POOL", "0");
+        if (mode && plat_mem_zero_pool_mode(0) < 0) mode = 0, applied = 0;
+        else if (mode) rt_log("mem: zeroed unit pool %s (MKW_ZERO_POOL)", mode == 2 ? "in the B blocks" : "on");
+    }
+    static int probed;
+    if (!probed) {
+        probed = 1;
+        char line[512] = "";
+        if (rt_knob("MAP_PROBE", "0") > 0 && plat_mem_map_probe(line, sizeof line)) rt_log("mem: map probe: %s", line);
+    }
+    int on = RT_KNOB_ON(mode);
+    if (on == applied) return;
+    plat_mem_zero_pool_mode(on);
+    applied = on;
+}
+
+// MKW_DECOMMIT_RUN (default 0, 1 in the PS5 profile: cfg.c has the runs; "ab"): decommits release whole units up to
+// 32 in a row with one unmap (ps5_guest_memory.c decommit_units): the unmap thread's 47 ms frz_lock holds over the
+// game's 21 MiB pools.
+static void decommit_run_placement(void) {
+    static int mode = -1, applied = -1;
+    if (mode < 0) {
+        mode = rt_knob("DECOMMIT_RUN", "0");
+        if (mode && plat_mem_decommit_run_mode(0) < 0) mode = 0, applied = 0;
+        else if (mode) rt_log("mem: decommits release unit runs in one unmap %s (MKW_DECOMMIT_RUN)",
+                              mode == 2 ? "in the B blocks" : "on");
+    }
+    int on = RT_KNOB_ON(mode);
+    if (on == applied) return;
+    plat_mem_decommit_run_mode(on);
+    applied = on;
+}
+
+// MKW_FILL_WINDOW (default 0, 1 in the PS5 profile: cfg.c has the runs; "ab"): units' first contents (unpacks, fresh
+// zeros) written through one shared window unmapped once per 32 units instead of a private map each (ps5_memory.c).
+static void fill_window_placement(void) {
+    static int mode = -1, applied = -1;
+    if (mode < 0) {
+        mode = rt_knob("FILL_WINDOW", "0");
+        if (mode && plat_mem_fill_window_mode(0) < 0) mode = 0, applied = 0;
+        else if (mode)
+            rt_log("mem: unit fills through a shared window %s (MKW_FILL_WINDOW)", mode == 2 ? "in the B blocks" : "on");
+    }
+    int on = RT_KNOB_ON(mode);
+    if (on == applied) return;
+    plat_mem_fill_window_mode(on);
+    applied = on;
+}
+
 void perf_present(uint64_t frame) {
     static uint64_t last, sum, max, n, win_start, ab_b;
     static int64_t win_prev[PERF_CNT_N];
@@ -507,6 +637,10 @@ void perf_present(uint64_t frame) {
     pw_batch_placement();
     pw_hot_placement();
     pw_fault_batch_placement();
+    unpack_batch_placement();
+    zero_pool_placement();
+    decommit_run_placement();
+    fill_window_placement();
     if (__atomic_load_n(&overlay, __ATOMIC_RELAXED))   // the overlay's only cost while it is off: this branch
         perfmon_frame(now, d, frame_ns, rep, __atomic_load_n(&counts[PERF_CNT_TEX_UP], __ATOMIC_RELAXED));
     kern_core_diag_frame(frame, d);
@@ -521,15 +655,20 @@ void perf_present(uint64_t frame) {
         const char *e = cfg_get("MKW_PERF_SLOW_MS");
         slow_ns = (uint64_t)(e && atoi(e) > 0 ? atoi(e) : 50) * 1000000ull;
     }
+    char costs[768], storm[512];
+    ledger_take(costs, sizeof costs, rep);   // every present, so a slow frame's ledger is its own period's
+    if (plat_mem_storm_take(storm, sizeof storm, 64))   // 64+ write faults: ~3x a normal frame's (protsplit, 28/11)
+        rt_log("perf: fault storm frame %llu: %s", (unsigned long long)frame, storm);
     if (last) {
         sum += d;
         n++;
         if (d > max) max = d, memcpy(worst_ns, frame_ns, sizeof worst_ns);
         if (d >= slow_ns)
-            rt_log("perf: slow frame %llu: %.1f ms; blocked pipeline %.1f texture %.1f astc %.1f fence %.1f pacing %.1f",
+            rt_log("perf: slow frame %llu: %.1f ms; blocked pipeline %.1f texture %.1f astc %.1f fence %.1f pacing %.1f; "
+                   "costs ms:%s; ab=%c",
                    (unsigned long long)frame, d / 1e6, frame_ns[PERF_PIPE] / 1e6,
                    frame_ns[PERF_TEX] / 1e6, frame_ns[PERF_ASTC] / 1e6, frame_ns[PERF_FENCE] / 1e6,
-                   frame_ns[PERF_PACE] / 1e6);
+                   frame_ns[PERF_PACE] / 1e6, costs, rt_ab() ? 'B' : 'A');
     }
     memset(frame_ns, 0, sizeof frame_ns);
     last = now;
@@ -563,6 +702,7 @@ void perf_present(uint64_t frame) {
                (span > wait_ns[PERF_PACE] ? span - wait_ns[PERF_PACE] : 0) / 1e6 / n,
                plat_xchg64(&replay_ns, 0) / 1e6 / n, (unsigned long long)ab_b, (unsigned long long)n, frame_step_world_us() / 1e6);
     if (n && span) perf_gpu_line(frame, sum / 1e6 / n, (double)wait_ns[PERF_PACE] / span, n);
+    if (n) ledger_window(frame, n);
     // MKW_LOCK_PROF=1: the waits per lock in this window (vk_sync.c's line needs 1,200 submissions; the boot has fewer),
     // and who held a lock while another thread waited on it
     if (n && span) {

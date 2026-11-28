@@ -535,6 +535,7 @@ static int upload_bands(Tex *e, uint32_t partial_since, int bw, int bh, int bpb,
         }
     }
     n_reuploads++, perf_count(PERF_CNT_TEX_REUP);
+    perf_ledger(PERF_LG_UPLOAD, dt);
     ru_n++, ru_bytes += up_bytes, ru_ns += dt;
     uint64_t full_raw = (uint64_t)rb * rows;
     if (full_raw > up_bytes) ru_skip_sub += nb - nd, ru_skip_bytes += full_raw - up_bytes;
@@ -821,6 +822,7 @@ static int upload(Tex *e, uint32_t partial_since) {
 counted:;
 #undef UP_PHASE
     uint64_t dt = kern_now_ns() - u0;
+    perf_ledger(PERF_LG_UPLOAD, dt);
     if (rt_trace & RT_TRACE_PERF) {
         up_ph_n++;
         for (int i = 0; i < UPH_N; i++) up_ph_ns[i] += ph[i];
@@ -1621,6 +1623,18 @@ void make_fresh(Tex *e) {
 // MKW_TRACE=perf: what the checks spend (vk_exec_par.c precheck's split): the snapshot answer, and the uploads.
 uint64_t vk_pc_snap_ns, vk_pc_up_n, vk_pc_up_ns;
 
+// MKW_SNAP_SCOPED (vk_mem_gen.c vk_mem_changed_scoped; default 0, 1 in the PS5 profile; "ab"): on now.
+int tex_snap_scoped(void) {
+    static int scoped = -1;
+    if (scoped < 0) {
+        int m = rt_knob("SNAP_SCOPED", "0");
+        if (m) rt_log("vk: texture checks peek their own span, no 2 MiB snapshot%s (MKW_SNAP_SCOPED)",
+                      m == 2 ? " in the B blocks" : "");
+        scoped = m;
+    }
+    return scoped && RT_KNOB_ON(scoped);
+}
+
 void make_fresh_snap(Tex *e) {
     e->seen = submit_epoch;   // as make_fresh
     if (!e->pub.mirrored) return;
@@ -1630,15 +1644,8 @@ void make_fresh_snap(Tex *e) {
     n_checks++;
     int perf = (rt_trace & RT_TRACE_PERF) != 0;
     uint64_t t0 = perf ? kern_now_ns() : 0;
-    static int scoped = -1;   // MKW_SNAP_SCOPED (vk_mem_gen.c vk_mem_changed_scoped; default 0, 1 in the PS5 profile; "ab")
-    if (scoped < 0) {
-        int m = rt_knob("SNAP_SCOPED", "0");
-        if (m) rt_log("vk: texture checks peek their own span, no 2 MiB snapshot%s (MKW_SNAP_SCOPED)",
-                      m == 2 ? " in the B blocks" : "");
-        scoped = m;
-    }
-    int ch = scoped && RT_KNOB_ON(scoped) ? vk_mem_changed_scoped(e->pub.addr, e->t.L.size, prev_wgen, &now)
-                                          : vk_mem_changed_snap(e->pub.addr, e->t.L.size, prev_wgen, submit_epoch, &now);
+    int ch = tex_snap_scoped() ? vk_mem_changed_scoped(e->pub.addr, e->t.L.size, prev_wgen, &now)
+                               : vk_mem_changed_snap(e->pub.addr, e->t.L.size, prev_wgen, submit_epoch, &now);
     uint64_t t1 = perf ? kern_now_ns() : 0;
     if (perf) __atomic_add_fetch(&vk_pc_snap_ns, t1 - t0, __ATOMIC_RELAXED);
     e->wgen = now;

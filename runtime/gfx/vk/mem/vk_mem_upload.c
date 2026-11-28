@@ -506,6 +506,7 @@ void vk_mem_governor(int force) {
         sh_freed = shadow_trim(128ull << 20);
     }
     uint64_t after = plat_mem_dmem_avail();
+    perf_ledger(PERF_LG_GOV, plat_now_ns() - t0);
     __atomic_add_fetch(hard ? &gov_hard_n : &gov_soft_n, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&gov_freed_bytes,
                        rel_freed + hr_freed + trim_freed + sp_freed + sh_freed + h0_freed + zero_freed + pk_freed,

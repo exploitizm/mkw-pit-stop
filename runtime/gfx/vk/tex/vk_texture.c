@@ -25,6 +25,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
+#include "prof.h"
 #include "nvn_tex.h"
 #include "tex.h"
 #include "vk.h"
@@ -48,6 +49,37 @@ uint64_t n_uploads, n_reuploads;
 // Re-uploads since the last perf line (tex_lock): all, those after WriteTexels, and subresources skipped by MKW_TEX_REUP_PARTIAL.
 uint64_t ru_n, ru_bytes, ru_ns, ru_wt_n, ru_wt_bytes, ru_wt_ns, ru_skip_sub, ru_skip_bytes;
 uint64_t tl_n, tl_ns, tl_max;       // lock() waits (MKW_TRACE=perf), vk_tex_internal.h
+uint64_t n_entries_made;
+volatile uint32_t tl_htid;           // the holder (vk_tex_internal.h tl_took)
+volatile uint64_t tl_hra, tl_ht0;
+const char *volatile tl_hname;
+static _Thread_local int tl_depth;
+static _Thread_local char tl_name[24];
+__attribute__((noinline)) void tl_took(void) {
+    if (tl_depth++) return;
+    if (!tl_name[0] && !plat_sample_self_name(tl_name, sizeof tl_name)) snprintf(tl_name, sizeof tl_name, "?");
+    tl_hname = tl_name, tl_htid = plat_thread_id(), tl_hra = (uint64_t)(uintptr_t)__builtin_return_address(0);
+    tl_ht0 = plat_now_ns();
+}
+void tl_site(uint64_t ra) {
+    if (tl_depth == 1) tl_hra = ra;
+}
+void tl_released(void) {
+    if (tl_depth > 0 && !--tl_depth) tl_htid = 0;
+}
+void tl_long_wait(uint64_t dt, uint32_t htid, uint64_t hra, uint64_t ht0, const char *hname) {
+    static volatile int32_t logged;
+    if (__atomic_add_fetch(&logged, 1, __ATOMIC_RELAXED) > 400) return;
+    char me[24] = "?", at[160] = "?", mine[160];
+    plat_sample_self_name(me, sizeof me);
+    if (hra) prof_pc_describe(hra, at, sizeof at);
+    prof_pc_describe((uint64_t)(uintptr_t)__builtin_return_address(0), mine, sizeof mine);
+    uint64_t now = plat_now_ns();
+    rt_log("vk: tex lock: %s waited %.1f ms (frame %llu, from %s); held by %s tid %#x for %.1f ms, taken at %s", me,
+           dt / 1e6, (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), mine,
+           htid ? (hname ? hname : "?") : "(none noted)", htid, htid && ht0 && now > ht0 ? (now - ht0) / 1e6 : 0.0,
+           htid ? at : "-");
+}
 volatile int tex_spin_on = 1;        // MKW_TEX_LOCK_SPIN (vk_tex_internal.h)
 void vk_texture_spin_update(void) {   // per present (vk_backend.c), so "ab" follows the blocks
     static int mode = -1;

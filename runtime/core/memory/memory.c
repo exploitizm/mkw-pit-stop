@@ -18,6 +18,8 @@
 #include "platform/platform.h"
 #include "memory_int.h"
 
+const char *prof_pc_describe(uint64_t pc, char *buf, int n);   // prof.h (core/diag), for mem_thaw's slow-call line
+
 #define PAGE 0x1000ull
 #define GiB (1ull << 30)
 #define STACK_OFF 0x10000000ull
@@ -118,11 +120,84 @@ static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
     for (uint64_t r = r0; r <= r1; r++) thaw_locked(r, why);
 }
 
+static uint32_t frz_htid;      // the holder (frz_note), 0 none
+static uintptr_t frz_hsite;
+static uint64_t frz_ht0;
+static const char *frz_hname;
+static _Thread_local char frz_name[24];
+void frz_note(uintptr_t site) {
+    if (!frz_name[0] && !plat_sample_self_name(frz_name, sizeof frz_name)) snprintf(frz_name, sizeof frz_name, "?");
+    __atomic_store_n(&frz_hname, frz_name, __ATOMIC_RELAXED);
+    __atomic_store_n(&frz_hsite, site, __ATOMIC_RELAXED);
+    __atomic_store_n(&frz_ht0, plat_now_ns(), __ATOMIC_RELAXED);
+    __atomic_store_n(&frz_htid, plat_thread_id(), __ATOMIC_RELEASE);
+}
+void frz_unnote(void) { __atomic_store_n(&frz_htid, 0, __ATOMIC_RELEASE); }
+
 void mem_thaw(uint64_t a, uint64_t n) {
+    int perf = (rt_trace & RT_TRACE_PERF) != 0;
+    uint64_t t0 = perf ? plat_now_ns() : 0;
     mem_commit_range(a, n);   // a kernel write does not fault into lazy_fault
+    uint64_t t1 = perf ? plat_now_ns() : 0;
+    uint32_t htid = perf ? __atomic_load_n(&frz_htid, __ATOMIC_ACQUIRE) : 0;   // the holder as the wait begins
+    uintptr_t hsite = htid ? __atomic_load_n(&frz_hsite, __ATOMIC_RELAXED) : 0;
+    uint64_t ht0 = htid ? __atomic_load_n(&frz_ht0, __ATOMIC_RELAXED) : 0;
+    const char *hname = htid ? __atomic_load_n(&frz_hname, __ATOMIC_RELAXED) : NULL;
     frz_take();   // also when nothing is frozen: the hold keeps a read's buffer writable
+    uint64_t t2 = perf ? plat_now_ns() : 0;
     thaw_range_locked(a, n, 2);
     frz_drop();
+    if (perf && plat_now_ns() - t0 >= 5000000ull) {
+        static volatile int32_t logged;
+        char site[160] = "-";
+        if (hsite) prof_pc_describe(hsite, site, sizeof site);
+        if (__atomic_add_fetch(&logged, 1, __ATOMIC_RELAXED) <= 400)
+            rt_log("memory: slow thaw of %#llx+%#llx: %.1f ms (commit %.1f, frz_lock wait %.1f, thaw %.1f); frz_lock held by "
+                   "%s tid %#x for %.1f ms, taken at %s", (unsigned long long)a, (unsigned long long)n,
+                   (plat_now_ns() - t0) / 1e6, (t1 - t0) / 1e6, (t2 - t1) / 1e6, (plat_now_ns() - t2) / 1e6,
+                   htid ? (hname ? hname : "?") : "(none noted)", htid, htid && t1 > ht0 ? (t1 - ht0) / 1e6 : 0.0, site);
+    }
+}
+
+// MKW_THAW_FAST (default 0 until measured, "ab"): the GPU write-backs' thaws (vk_mem_merge.c, vk_mem_wback.c) skip
+// frz_lock when nothing over the range needs one: no 2 MiB region frozen, no page trapped (read, early-read, base or
+// spill trap), no lazy commit (Windows). Both maps are read without the lock as mem_trapped does. A freeze or a trap
+// made after the look meets the write-back's store as any guest write: it faults, and the fault thaws. Stall trace of
+// 28/11/2026 (thaw1/ms-ab, 1.8.0 GP): the completion thread's merge waited 43-56 ms in one mem_thaw of a 0.2 KiB range
+// for frz_lock, held by a guest thread's Map/UnmapPhysicalMemory of a 5-21 MiB pool, and the fence's waiters (the
+// game's main thread) with it: the race's 50-94 ms frames.
+static int lazy;   // (defined with the lazy commit below)
+static int thaw_idle(uint64_t a, uint64_t n) {
+    if (lazy || !n || a >= RT_ADDRESS_LIMIT || n > RT_ADDRESS_LIMIT - a) return 0;
+    for (uint64_t r = a >> FRZ_SHIFT; r <= (a + n - 1) >> FRZ_SHIFT; r++)
+        if (__atomic_load_n(&frz[r], __ATOMIC_ACQUIRE)) return 0;
+    uint8_t *t = __atomic_load_n(&trapped, __ATOMIC_ACQUIRE);
+    if (t)
+        for (uint64_t p = a / PAGE; p <= (a + n - 1) / PAGE; p++)
+            if (__atomic_load_n(&t[p], __ATOMIC_RELAXED)) return 0;
+    return 1;
+}
+
+static uint64_t thaw_fast_skips, thaw_fast_locked;
+void mem_thaw_wb(uint64_t a, uint64_t n) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("THAW_FAST", "0");
+    if (RT_KNOB_ON(mode) && thaw_idle(a, n)) {
+        // Still the thaw request's hold (thaw_locked why 2): without it the regions the GPU writes back into froze
+        // again at once, and the guest's next writes faulted to thaw them and MKW_PACK packed them sooner; every
+        // THAW_FAST run of 28/11/2026 scored a 1 % low of 38.2-39.8 fps against 42.1-43.3 without (zp1_*, zs_*,
+        // zt_*). A freeze that reads the old time meets the write-back's store as any guest write: it faults.
+        uint32_t now = (uint32_t)plat_now_ms() | 1;
+        for (uint64_t r = a >> FRZ_SHIFT; r <= (a + n - 1) >> FRZ_SHIFT; r++) __atomic_store_n(&thaw_ms[r], now, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&thaw_fast_skips, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    if (RT_KNOB_ON(mode)) __atomic_add_fetch(&thaw_fast_locked, 1, __ATOMIC_RELAXED);
+    mem_thaw(a, n);
+}
+void mem_thaw_wb_stats(uint64_t *skipped, uint64_t *locked) {
+    *skipped = __atomic_exchange_n(&thaw_fast_skips, 0, __ATOMIC_RELAXED);
+    *locked = __atomic_exchange_n(&thaw_fast_locked, 0, __ATOMIC_RELAXED);
 }
 
 static void thaw_for_kernel(uint64_t a, size_t n) { if (watched(a, n)) mem_thaw(a, n); }   // plat_mem_thaw_hook
@@ -328,8 +403,14 @@ void mem_untrap(uint64_t a, uint64_t n) {
     frz_drop();
 }
 
-void mem_hold_layout(void) { plat_mutex_lock(&frz_lock); }
-void mem_release_layout(void) { plat_mutex_unlock(&frz_lock); }
+void mem_hold_layout(void) {
+    plat_mutex_lock(&frz_lock);
+    if (!frz_held && (rt_trace & RT_TRACE_PERF)) frz_note((uintptr_t)__builtin_return_address(0));
+}
+void mem_release_layout(void) {
+    if (!frz_held && (rt_trace & RT_TRACE_PERF)) frz_unnote();
+    plat_mutex_unlock(&frz_lock);
+}
 
 int mem_trapped(uint64_t a) { return trapped && a < RT_ADDRESS_LIMIT && __atomic_load_n(&trapped[a / PAGE], __ATOMIC_RELAXED) == 1; }
 
@@ -802,6 +883,105 @@ uint32_t mem_unmap(uint64_t dst, uint64_t src, uint64_t n) { return stack_move(1
 
 // ---- 0x2C/0x2D MapPhysicalMemory, UnmapPhysicalMemory. Horizon maps only the still-unmapped pages of the range and
 // leaves mapped pages and their contents alone; TotK's heaps grow by re-mapping ranges they partly own.
+// MKW_UNMAP_DEFER (default 0, 1 in the PS5 profile: cfg.c has the A/B; "ab"): UnmapPhysicalMemory's release of the pages (decommit) runs on the
+// "unmap" thread instead of the game's. Pool-churn log of 28/11/2026 (churn1, 1.8.0 GP): the game's 20-21 MiB pools
+// took 56-61 ms each to unmap on the game's own thread (~180 us per 64 KiB unit released), 3-4 a race at the same
+// stretch, the race's 50-90 ms frames. The game no longer touches what it unmapped; a map over a range whose release
+// is still pending first makes it (or waits for the thread's), so a mapping always starts from released, zeroed pages
+// as before. The thread takes frz_lock as decommit always did and not `lock`: the map path drains while it holds
+// `lock`, so a map and a release of one range never interleave. Not with the lazy commit (Windows): a fault there
+// commits alias pages outside this path.
+typedef struct { uint64_t a, n; int busy; } PendUnmap;
+enum { PEND_N = 64 };
+static PendUnmap pend[PEND_N];
+static int npend, pend_started;
+static PlatMutex pend_lock = PLAT_MUTEX_INIT;
+static PlatCond pend_cv = PLAT_COND_INIT, pend_done = PLAT_COND_INIT;
+static uint64_t pend_deferred, pend_drained;   // since the last line (mem_unmap_defer_stats)
+
+static void decommit(uint64_t a, uint64_t n, const char *what);
+
+static void unmap_main(void *arg) {
+    (void)arg;
+    plat_mutex_lock(&pend_lock);
+    for (;;) {
+        int i = 0;
+        while (i < npend && pend[i].busy) i++;
+        if (i == npend) {
+            plat_cond_wait(&pend_cv, &pend_lock);
+            continue;
+        }
+        pend[i].busy = 1;
+        uint64_t a = pend[i].a, n = pend[i].n;
+        plat_mutex_unlock(&pend_lock);
+        // MKW_UNMAP_SLICE (default 0 until measured, "ab"): a 2 MiB freeze region at a time, with a pause between, so a
+        // thread waiting for frz_lock takes it in between: whole, a 21 MiB release held it ~50 ms, and the completion
+        // thread's write-back thaw and the game's next MapPhysicalMemory (commit takes it too) waited 50-56 ms behind it
+        // (now1, 28/11/2026). Safe here as it was not on the map path: nobody reads a range the game unmapped, and a map
+        // over it drains first (busy: waits for this one).
+        static int slice = -1;
+        if (slice < 0) slice = rt_knob("UNMAP_SLICE", "0");
+        if (RT_KNOB_ON(slice))
+            for (uint64_t x = a, y; x < a + n; x = y) {
+                y = ((x + FRZ_SIZE) & ~(FRZ_SIZE - 1)) < a + n ? ((x + FRZ_SIZE) & ~(FRZ_SIZE - 1)) : a + n;
+                decommit(x, y - x, "physical memory (deferred)");
+                if (y < a + n) plat_sleep_ns(100000);
+            }
+        else
+            decommit(a, n, "physical memory (deferred)");
+        plat_mutex_lock(&pend_lock);
+        for (int k = 0; k < npend; k++)
+            if (pend[k].busy && pend[k].a == a && pend[k].n == n) { pend[k] = pend[--npend]; break; }
+        plat_cond_broadcast(&pend_done);
+    }
+}
+
+// under lock: 1 when [a, a+n)'s release went to the unmap thread
+static int unmap_defer(uint64_t a, uint64_t n) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("UNMAP_DEFER", "0");
+    if (lazy || !RT_KNOB_ON(mode)) return 0;
+    plat_mutex_lock(&pend_lock);
+    if (!pend_started) {
+        pend_started = plat_thread_spawn(unmap_main, NULL, "unmap", 0) ? 1 : -1;
+        if (pend_started > 0) rt_log("memory: UnmapPhysicalMemory releases on their own thread%s (MKW_UNMAP_DEFER)",
+                                     mode == 2 ? " in the B blocks" : "");
+    }
+    int ok = pend_started > 0 && npend < PEND_N;
+    if (ok) pend[npend++] = (PendUnmap){a, n, 0}, pend_deferred++, plat_cond_broadcast(&pend_cv);
+    plat_mutex_unlock(&pend_lock);
+    return ok;
+}
+
+// under lock, before a map over [a, a+n): the releases pending there are made first
+static void unmap_drain(uint64_t a, uint64_t n) {
+    if (!__atomic_load_n(&npend, __ATOMIC_ACQUIRE)) return;
+    plat_mutex_lock(&pend_lock);
+    for (;;) {
+        int i = 0;
+        while (i < npend && !overlaps(a, n, pend[i].a, pend[i].n)) i++;
+        if (i == npend) break;
+        if (pend[i].busy) {   // the thread is releasing it: wait for it
+            plat_cond_wait(&pend_done, &pend_lock);
+            continue;
+        }
+        uint64_t pa = pend[i].a, pn = pend[i].n;
+        pend[i] = pend[--npend];
+        pend_drained++;
+        plat_mutex_unlock(&pend_lock);
+        decommit(pa, pn, "physical memory (drained)");
+        plat_mutex_lock(&pend_lock);
+    }
+    plat_mutex_unlock(&pend_lock);
+}
+
+void mem_unmap_defer_stats(uint64_t *deferred, uint64_t *drained) {
+    plat_mutex_lock(&pend_lock);
+    *deferred = pend_deferred, *drained = pend_drained;
+    pend_deferred = pend_drained = 0;
+    plat_mutex_unlock(&pend_lock);
+}
+
 static void alias_runs(uint64_t first, uint64_t count, uint8_t want, int do_commit) {   // under lock
     uint64_t i = 0;
     while (i < count) {
@@ -812,7 +992,7 @@ static void alias_runs(uint64_t first, uint64_t count, uint8_t want, int do_comm
         if (do_commit) {
             if (!lazy) commit(a, n, "physical memory");
         }
-        else decommit(a, n, "physical memory");
+        else if (!unmap_defer(a, n)) decommit(a, n, "physical memory");
         memset(alias_pages + first + i, !want, j - i);
         i = j;
     }
@@ -822,7 +1002,11 @@ static uint32_t alias_map(int unmap, uint64_t a, uint64_t n) {
     if (!n || ((a | n) & (PAGE - 1))) return R_INVALID_ADDRESS;
     if (!inside(a, n, L.alias)) return R_INVALID_REGION;
     uint64_t first = (a - L.alias.base) / PAGE, count = n / PAGE;
+    // MKW_TRACE=perf: a call of 5 ms or more is logged (the game's own thread waits for it: its pool churn at a race's
+    // 50-90 ms frames, stall trace of 28/11/2026)
+    uint64_t am_t0 = (rt_trace & RT_TRACE_PERF) ? plat_now_ns() : 0;
     plat_mutex_lock(&lock);
+    uint64_t am_t1 = am_t0 ? plat_now_ns() : 0;
     uint32_t r = R_OK;
     if (unmap) {
         for (unsigned i = 0; i < nstack_maps; i++)
@@ -841,11 +1025,21 @@ static uint32_t alias_map(int unmap, uint64_t a, uint64_t n) {
             r = R_LIMIT_REACHED;   // the SDK maps LimitReached to its recoverable out-of-memory result
             goto out;
         }
+        unmap_drain(a, n);   // (MKW_UNMAP_DEFER)
         alias_runs(first, count, 0, 1);
         alias_bytes += fresh * PAGE;
     }
 out:
     plat_mutex_unlock(&lock);
+    if (am_t0 && plat_now_ns() - am_t0 >= 5000000ull) {
+        static volatile int32_t logged;
+        char who[24] = "?";
+        plat_sample_self_name(who, sizeof who);
+        if (__atomic_add_fetch(&logged, 1, __ATOMIC_RELAXED) <= 200)
+            rt_log("memory: slow %sMapPhysicalMemory %#llx+%#llx (%.1f MiB) by %s: %.1f ms (lock wait %.1f)",
+                   unmap ? "Un" : "", (unsigned long long)a, (unsigned long long)n, n / 1048576.0, who,
+                   (plat_now_ns() - am_t0) / 1e6, (am_t1 - am_t0) / 1e6);
+    }
     if (r) rt_log("%sMapPhysicalMemory %#llx+%#llx failed %#x (alias %#llx used, heap %#llx)", unmap ? "Un" : "",
                   (unsigned long long)a, (unsigned long long)n, r, (unsigned long long)alias_bytes,
                   (unsigned long long)heap_size);

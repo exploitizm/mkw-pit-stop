@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "hangwatch.h"
 #include "kernel_int.h"
 #include "platform/platform.h"
 
@@ -127,6 +128,7 @@ static int g_wait_ns = -1;
 
 // Sleeps until woken or ns pass (ns < 0: no limit), holding m, which guards list (t is on it).
 static uint32_t wait_woken(RtThread *t, int64_t ns, PlatMutex *m, RtThread **list) {
+    const char *hm_prev = hang_mark("kernel: waiting (svc)");   // MKW_STALL_TRACE (hangwatch.c)
     uint64_t now = kern_now_ns();
     int forever = ns < 0 || (uint64_t)ns > UINT64_MAX - now;
     uint64_t deadline = forever ? 0 : now + (uint64_t)ns;
@@ -140,6 +142,7 @@ static uint32_t wait_woken(RtThread *t, int64_t ns, PlatMutex *m, RtThread **lis
             wait_unlink(list, t);
             t->wkind = W_NONE;
             if (rt_trace & RT_TRACE_SCHED) t->ho_wake_at = 0;
+            hang_mark(hm_prev);
             return R_TIMEOUT;
         }
         if (g_wait_ns < 0) g_wait_ns = rt_knob("WAIT_NS", "0");
@@ -158,6 +161,7 @@ static uint32_t wait_woken(RtThread *t, int64_t ns, PlatMutex *m, RtThread **lis
     } else if (rt_trace & RT_TRACE_SCHED) {
         t->ho_wake_at = 0;
     }
+    hang_mark(hm_prev);
     return t->wres;
 }
 

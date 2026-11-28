@@ -20,6 +20,7 @@
 #include "cfg.h"
 #include "hangwatch.h"
 #include "host.h"
+#include "prof.h"
 #include "nvn_api.h"
 #include "vk.h"
 #include "vk_sync_ts.h"
@@ -321,12 +322,21 @@ static void completion_main(void *arg) {
             hang_mark("completion: running a side effect (slot_reap takes sp_lock)");
             __atomic_store_n(&comp_cb_fn, p.fn, __ATOMIC_RELAXED);
             __atomic_store_n(&comp_cb_since, (int64_t)kern_now_ns(), __ATOMIC_RELAXED);
-            if (vk_tl_on() > 0) {
-                uint64_t t0 = kern_now_ns();
-                p.fn(p.arg);
-                cb_note(p.fn, kern_now_ns() - t0);
-            } else {
-                p.fn(p.arg);
+            uint64_t cb0 = kern_now_ns();
+            p.fn(p.arg);
+            uint64_t cb_ns = kern_now_ns() - cb0;
+            if (vk_tl_on() > 0) cb_note(p.fn, cb_ns);
+            // MKW_TRACE=perf: a side effect of 2 ms or more runs before the fence's waiters are released (below), so
+            // the game's nvnSyncWait waits for it too: the stall trace of 28/11/2026 had this thread 45 ms in side
+            // effects through a 79 ms frame
+            if ((rt_trace & RT_TRACE_PERF) && cb_ns >= 2000000) {
+                static volatile int32_t n_slow;
+                if (plat_inc32(&n_slow) <= 200) {
+                    char d[160];
+                    prof_pc_describe((uint64_t)(uintptr_t)p.fn, d, sizeof d);
+                    rt_log("vk: completion side effect %s took %.1f ms (fence %llu, %d more queued)", d, cb_ns / 1e6,
+                           (unsigned long long)p.fence, qn);
+                }
             }
             hang_mark(NULL);
             __atomic_store_n(&comp_cb_since, 0, __ATOMIC_RELAXED);

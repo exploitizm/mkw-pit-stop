@@ -310,6 +310,27 @@ uint64_t plat_mem_release_zero_backing(uint64_t addr, uint64_t size);
 // PS5: page-protection calls by caller since the last call (count, ns); ra 1 and 2 are the write watch's unprotect and
 // arm. Nothing elsewhere.
 void plat_mem_protect_stats(void (*emit)(uintptr_t ra, uint64_t n, uint64_t ns, void *ctx), void *ctx);
+// Running totals of page-protection calls by kind (ns) and PACK unpacks (ns), every thread, and the protection calls'
+// count (PS5; zeros elsewhere): perf.c differences them per frame for its cost ledger. Kinds: the write watch's fault
+// unprotect, arm and hold unprotect (prot_watch.c), change_locked (freeze, thaw, plat_mem_protect) and the early-read
+// watch (plat_mem_early_*).
+// Then the unit commits' steps on every thread (ps5_memory.c, fresh and unpacked alike): direct-memory allocation, the
+// private map and unmap, the fill, the fixed map; the fresh units' whole commits and their count.
+enum { PLAT_MEM_COST_PROT_FAULT, PLAT_MEM_COST_PROT_ARM, PLAT_MEM_COST_PROT_HOLD, PLAT_MEM_COST_PROT_CHANGE,
+       PLAT_MEM_COST_PROT_EARLY, PLAT_MEM_COST_UNPACK, PLAT_MEM_COST_PROT_CALLS, PLAT_MEM_COST_BACK_ALLOC,
+       PLAT_MEM_COST_BACK_PRIVMAP, PLAT_MEM_COST_BACK_FILL, PLAT_MEM_COST_BACK_FIXED, PLAT_MEM_COST_BACK_FRESH,
+       PLAT_MEM_COST_BACK_FRESH_N, PLAT_MEM_COST_BACK_TOTAL, PLAT_MEM_COST_N };
+void plat_mem_cost_ns(uint64_t out[PLAT_MEM_COST_N]);
+// The fault storm since the last call (PS5; 0 elsewhere): with min_faults or more, the busiest regions and writers into
+// out and 1; the tables are cleared either way (ps5_guest_memory.c storm_note).
+int plat_mem_storm_take(char *out, size_t cap, uint32_t min_faults);
+int plat_mem_unpack_batch_mode(int on);   // MKW_UNPACK_BATCH (PS5; -1 elsewhere)
+int plat_mem_zero_pool_mode(int on);      // MKW_ZERO_POOL (PS5; -1 elsewhere)
+int plat_mem_decommit_run_mode(int on);   // MKW_DECOMMIT_RUN (PS5; -1 elsewhere)
+int plat_mem_fill_window_mode(int on);    // MKW_FILL_WINDOW (PS5; -1 elsewhere)
+int plat_mem_map_probe(char *out, size_t cap);          // MKW_MAP_PROBE (PS5; nothing elsewhere)
+// since the last call: taken zeroed, taken not yet zeroed, missed, recycled, zeroed; units ready now (0s elsewhere)
+void plat_mem_zero_pool_stats(uint64_t out[7]);
 void plat_mem_back_causes(uint64_t out[PLAT_BACK_N]);
 int plat_mem_watch_info(uint64_t addr);
 void plat_mem_gpu_import(uint64_t addr, size_t n, int on);
@@ -357,7 +378,7 @@ typedef struct {
     uint32_t cold_ms;        // frozen at least this long, and not unpacked for this long
     uint32_t budget_us;      // stop after this long (0 none)
     int verify;              // keep each unit's bytes too and compare them on unpack (MKW_PACK_VERIFY)
-    int backoff;             // a unit unpacked again waits twice as long, each time (MKW_PACK_BACKOFF)
+    int backoff;             // a unit unpacked again waits twice as long, each time; 2: never packed again (MKW_PACK_BACKOFF)
 } PlatPackParams;
 uint64_t plat_mem_pack(const PlatPackParams *p);   // bytes of direct memory given back
 uint64_t plat_mem_pack_range(uint64_t lo, uint64_t hi, const PlatPackParams *p);   // the same over [lo, hi) only

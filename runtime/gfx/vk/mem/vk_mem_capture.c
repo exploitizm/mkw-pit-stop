@@ -229,7 +229,9 @@ uint64_t vk_mem_shadow_capture(uint64_t sub) {
         if (npacks == cpacks) vk_mem_grow((void **)&packs, &cpacks, sizeof *packs);
         packs[npacks++] = (CapPack){sub, runs, nruns};   // (in capture order, and sub never goes back: last_sub)
     }
-    c_subs++, c_pools += (uint64_t)n, c_bytes += bytes, c_ns += qpc() - t0;
+    uint64_t cap_dt = qpc() - t0;
+    c_subs++, c_pools += (uint64_t)n, c_bytes += bytes, c_ns += cap_dt;
+    perf_ledger(PERF_LG_CAPTURE, cap_dt);
     if (c_subs >= 1500) log_locked();   // ~5 s of race; shadow_log only runs at a few frames
     plat_mutex_unlock(&cap_lock);
     plat_mutex_unlock_shared(&pool_lock);

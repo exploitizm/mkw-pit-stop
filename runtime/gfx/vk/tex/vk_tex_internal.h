@@ -115,6 +115,8 @@ extern PlatMutex owned_lock;
 extern Tex **owned;
 extern int nowned, cowned;
 extern uint64_t max_owned, gpu_writes, n_checks;
+extern uint64_t n_entries_made;   // entries entry_of created (tex_lock), for the precheck slow-pass line
+int tex_snap_scoped(void);   // MKW_SNAP_SCOPED on now (vk_tex_upload.c)
 extern uint32_t agen[AGEN_N];
 extern uint64_t *sinfo, *schk;
 void tex_init(void *p);
@@ -134,6 +136,19 @@ void barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src, VkAccessFlags2 sa, V
 // (run hang05, 16/11/2026) had the game's texture registration and the chunk threads waiting on tex_lock while the
 // replay re-uploaded whole textures under it.
 extern uint64_t tl_n, tl_ns, tl_max;
+// Also with MKW_TRACE=perf: who holds it. The outermost take on each thread notes the thread and its call site
+// (tl_took: noinline, so its return address is the site where lock() was inlined), the last release clears it, and a
+// wait of TL_LONG_NS or more logs the waiter, the holder, how long it had held it and where it took it (vk_texture.c
+// tl_long_wait). Bench of 28/11/2026: "replay > precheck > texlock" was ~30 % of the 1 % low's frames, and the frames
+// that ended a memory-governor pass had the precheck at 11-16 ms and lock waits at 6-8 ms.
+#define TL_LONG_NS 2000000ull
+void tl_took(void);
+void tl_site(uint64_t ra);   // vk_texture_lock: its own caller as the site
+void tl_released(void);
+void tl_long_wait(uint64_t dt, uint32_t htid, uint64_t hra, uint64_t ht0, const char *hname);
+extern volatile uint32_t tl_htid;
+extern volatile uint64_t tl_hra, tl_ht0;
+extern const char *volatile tl_hname;
 // MKW_TEX_LOCK_SPIN (default 1; "ab", applied per present by vk_texture_spin_update): a lock() that finds tex_lock
 // taken tries again for up to TEX_SPIN_NS before it sleeps. Its holds are ~1 us (the chunk threads' descriptor
 // lookups, 1,100-1,500 a frame) and a sleep costs a wake of ~15-20 us: in a course's streaming bursts the chunk threads
@@ -157,14 +172,27 @@ static inline void lock(void) {
         if (!plat_rmutex_trylock(&tex_lock) && !tex_spin()) plat_rmutex_lock(&tex_lock);
         return;
     }
-    if (plat_rmutex_trylock(&tex_lock)) return;
+    if (plat_rmutex_trylock(&tex_lock)) {
+        tl_took();
+        return;
+    }
+    uint32_t htid = tl_htid;   // the holder as the wait begins
+    uint64_t hra = tl_hra, ht0 = tl_ht0;
+    const char *hname = tl_hname;
     uint64_t t0 = plat_now_ns();
     if (!tex_spin()) plat_rmutex_lock(&tex_lock);
     uint64_t dt = plat_now_ns() - t0;
     tl_n++, tl_ns += dt;
+    perf_ledger(PERF_LG_TEXLOCK, dt);
     if (dt > tl_max) tl_max = dt;
+    if (dt >= TL_LONG_NS) tl_long_wait(dt, htid, hra, ht0, hname);
+    tl_took();
 }
-static inline void unlock(void) { plat_rmutex_unlock(&tex_lock); }
+static inline void unlock(void) {
+    if (rt_trace & RT_TRACE_PERF) tl_released();
+    plat_rmutex_unlock(&tex_lock);
+}
+#define TL_TOOK() ((rt_trace & RT_TRACE_PERF) ? tl_took() : (void)0)   // after a direct take of tex_lock
 
 // An entry a caller keeps using across a call that may run short of staging (vk_texture_trim, evict_idle and the
 // release sweeps then free textures on this thread): those skip a pinned one.

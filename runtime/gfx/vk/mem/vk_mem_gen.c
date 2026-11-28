@@ -282,6 +282,34 @@ int mem_written_any(uint64_t addr, uint64_t size);   // memory.c (MKW_SNAP_SCOPE
 // -0.28 / -0.14 ms and busy -0.55 / -0.84 ms (scoped-1p, 24/11/2026). A 1.8.0 race with it on, watched on screen by
 // the user, showed no stale texture (a missed write would show only there): on in the PS5 profile (cfg.c). Off
 // elsewhere: without a peek (plat_mem_written_any) every check would query its span.
+// vk_mem_changed_scoped's answer when it needs nothing but reads: 0 or 1 as it would answer, -2 when it would query or
+// re-arm the write watch (written pages, a span not watched or past the snapshot regions), which must stay on the
+// caller's serial path. Any thread, with the texture lock held by the caller's job (MKW_PRECHECK_PAR, vk_tex_slots.c).
+int vk_mem_changed_peek(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) {
+    if (!size) { *now = since; return 0; }
+    uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
+    uint64_t r0 = lo >> REG_SHIFT, r1 = (hi - 1) >> REG_SHIFT;
+    if (r1 >= SNAP_REGIONS) return -2;
+    gen_lock_s();
+    uint32_t g = gen_now;
+    int changed = 0, all_frozen = 1;
+    for (uint64_t r = r0; r <= r1; r++) {
+        if (all_frozen && !mem_frozen(r << REG_SHIFT)) all_frozen = 0;
+        if (!changed && reg_max[r] > since) {
+            uint64_t a = r << REG_SHIFT > lo ? r << REG_SHIFT : lo, b = (r + 1) << REG_SHIFT < hi ? (r + 1) << REG_SHIFT : hi;
+            for (; a < b && !changed; a += 1ull << GEN_PAGE_SHIFT) {
+                uint32_t *s = gen_slot(a, 0);
+                if (s && *s > since) changed = 1;
+            }
+        }
+    }
+    int w = all_frozen ? 0 : mem_written_any(lo, hi - lo);
+    plat_mutex_unlock_shared(&gen_lock);
+    if (w) return -2;
+    *now = g;
+    return changed;
+}
+
 int vk_mem_changed_scoped(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) {
     if (!size) { *now = since; return 0; }
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;

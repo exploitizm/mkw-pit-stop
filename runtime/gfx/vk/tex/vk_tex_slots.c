@@ -103,7 +103,10 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
     return e;
 }
 
-void vk_texture_lock(void) { lock(); }
+void vk_texture_lock(void) {
+    lock();
+    if (rt_trace & RT_TRACE_PERF) tl_site((uint64_t)(uintptr_t)__builtin_return_address(0));
+}
 void vk_texture_unlock(void) { unlock(); }
 uint32_t vk_texture_slots_gen(void) { return slots_gen; }
 
@@ -169,6 +172,14 @@ static void late_note(int id, const TexSlot *s) {
 
 static const VkTexImage *by_id(int id, view_t *view, int *has_view, int sampled);
 
+// MKW_TRACE=perf: slots resolved again under tex_lock, and of them those that made a new entry (entry_of), read and
+// reset by vk_texture_resolve_stats (vk_exec_par.c precheck's slow-pass line)
+static uint64_t rs_n, rs_ns, rs_new, rs_new_ns;
+void vk_texture_resolve_stats(uint64_t *n, uint64_t *ns, uint64_t *made, uint64_t *made_ns) {
+    *n = rs_n, *ns = rs_ns, *made = rs_new, *made_ns = rs_new_ns;
+    rs_n = rs_ns = rs_new = rs_new_ns = 0;
+}
+
 const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) { return by_id(id, view, has_view, 1); }
 const VkTexImage *vk_texture_storage_by_id_locked(int id, view_t *view, int *has_view) {
     return by_id(id, view, has_view, 0);
@@ -182,7 +193,13 @@ static const VkTexImage *by_id(int id, view_t *view, int *has_view, int sampled)
     if (!s->ce || s->cgen != g) {   // resolved again: an entry at its address was created, dropped or released, or the
         view_t v;                   // slot registered (s->ce cleared); an empty result is not kept: image creation may
         int hv;                     // succeed later
+        uint64_t r0 = (rt_trace & RT_TRACE_PERF) ? kern_now_ns() : 0, nb = r0 ? n_entries_made : 0;
         s->ce = slot_resolve(s, &v, &hv);   // entry_of may create an entry and bump g: g read before it
+        if (r0) {
+            uint64_t d = kern_now_ns() - r0;
+            rs_n++, rs_ns += d;
+            if (n_entries_made != nb) rs_new += n_entries_made - nb, rs_new_ns += d;
+        }
         s->cview = v, s->chas_view = (uint8_t)hv;
         s->cgen = g;
         s->cepoch = 0;
@@ -233,6 +250,64 @@ int vk_texture_checked(int id, uint32_t ep) {
     if (!v || (uint32_t)(v >> 32) != ep) return 0;
     uint64_t si = __atomic_load_n(&sinfo[id], __ATOMIC_ACQUIRE);
     return (uint32_t)v == __atomic_load_n(&agen[si & 0xffff], __ATOMIC_ACQUIRE);
+}
+
+// MKW_PRECHECK_PAR (vk_exec_par.c precheck): the clean checks of a submission's slots in parallel. The slots whose entry
+// by_id would take as it is (resolved, same agen, not registered late) and check with make_fresh_snap's clean path
+// (uploaded, mirrored, not GPU-owned, nothing pending, MKW_SNAP_SCOPED) have their write-watch peek on the ASTC pool
+// and the caller (vk_mem_changed_peek, read-only); those that peeked clean are then marked checked here as by_id would
+// (seen, wgen, checked, cepoch, schk). Every other slot, and a peek that saw a write or would re-arm the watch, is left
+// to the caller's serial vk_texture_by_id_locked. The caller holds tex_lock throughout: nothing else changes the
+// entries meanwhile. Rsplit bench (28/11/2026): the precheck was 1.5 ms of a normal frame's replay and 4-6.7 ms in the
+// frames over 20 ms, done on the replay thread while the chunk threads waited for the walk.
+typedef struct { TexSlot *s; Tex *e; int id; uint32_t prev, now; int res; } PeekItem;
+static PeekItem *pk_items;
+static uint32_t pk_cap;
+
+static void peek_range(void *arg, uint32_t i0, uint32_t i1) {
+    PeekItem *it = arg;
+    for (uint32_t i = i0; i < i1; i++)
+        it[i].res = vk_mem_changed_peek(it[i].e->pub.addr, it[i].e->t.L.size, it[i].prev, &it[i].now);
+}
+
+int vk_texture_precheck_par(const uint32_t *ids, int n, uint32_t ep) {
+    if (n < 64 || !tex_snap_scoped() || vk_tex_reg_limit) return 0;
+    if ((uint32_t)n > pk_cap) {
+        uint32_t c = pk_cap ? pk_cap : 4096;
+        while (c < (uint32_t)n) c *= 2;
+        PeekItem *p = realloc(pk_items, sizeof *p * c);
+        if (!p) return 0;
+        pk_items = p, pk_cap = c;
+    }
+    uint32_t m = 0;
+    for (int i = 0; i < n; i++) {
+        int id = (int)ids[i];
+        if (id < 0 || id >= ntslots || !tslots[id].used) continue;
+        TexSlot *s = &tslots[id];
+        Tex *e = s->ce;
+        if (!e || s->cgen != agen[sinfo[id] & 0xffff] || s->cepoch == ep || e->checked == ep || !e->uploaded ||
+            !e->pub.mirrored || e->pub.gpu_owned || e->up_pending)
+            continue;
+        pk_items[m++] = (PeekItem){.s = s, .e = e, .id = id, .prev = e->wgen};
+    }
+    if (m < 64 || !astc_mt_for(peek_range, pk_items, m, 64)) return 0;   // (pool busy: the serial path does all)
+    int done = 0;
+    for (uint32_t i = 0; i < m; i++) {
+        PeekItem *it = &pk_items[i];
+        Tex *e = it->e;
+        if (it->res != 0 || it->s->cepoch == ep) continue;
+        if (e->checked != ep) {   // (two slots of one entry: the first marks it)
+            if (e->sparse && e->seen != ep) vk_sparse_touch(e->pub.image);
+            e->seen = ep, e->wgen = it->now, e->last_ch = 0, e->checked = ep;
+            n_checks++;
+        } else {
+            e->seen = ep;
+        }
+        it->s->cepoch = ep;
+        __atomic_store_n(&schk[it->id], (uint64_t)ep << 32 | it->s->cgen, __ATOMIC_RELEASE);
+        done++;
+    }
+    return done;
 }
 
 // vk_dump: the swizzle selectors of the descriptor registered in slot id; 0 when the slot is empty.

@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "hangwatch.h"
 #include "kernel_int.h"
 #include "platform/platform.h"
 
@@ -234,6 +235,8 @@ static void core_take_gated(RtThread *t) {
         if (t->cur_core >= 0) g_ap_spin_ok++;
     }
     int sampled = 0;
+    // MKW_STALL_TRACE (hangwatch.c): a guest thread waiting for a virtual core shows as such, not as running
+    const char *hm_prev = hang_mark("kernel: waiting for a core");
     while (t->cur_core < 0) {
         uint32_t ms = 0;   // 0: until signalled
         if (g_ap_int && ap_try(t) != AP_NONE) ms = 1;   // the owner keeps its core: again in a millisecond
@@ -259,6 +262,7 @@ static void core_take_gated(RtThread *t) {
         t->grant_at = 0;
     }
     t->target = NULL;
+    hang_mark(hm_prev);
     acct(t, S_RUN);
 }
 

@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "hangwatch.h"
 #include "host.h"
 #include "nvn_pool_index.h"
 #include "vk.h"
@@ -168,8 +169,11 @@ void vk_mem_gpu_pending(uint64_t addr, uint64_t size) {
     }
 }
 
+// The stages below carry checkpoints for MKW_STALL_TRACE (hangwatch.c): on the completion thread they run before the
+// fence's waiters are released, and a race's ~50 ms cb_done calls (stall2/wbh-ab, 28/11/2026) did not come from faults.
 void vk_gpu_written(uint64_t addr, uint64_t size) {
     if (shadow_live && size) {
+        const char *hm = hang_mark("write-back: pool_lock");
         plat_mutex_lock_shared(&pool_lock);
         const pidx_ent *e = pidx_find(&pool_index, addr, size);
         PoolRec *r = e ? e->buf : NULL;
@@ -186,6 +190,7 @@ void vk_gpu_written(uint64_t addr, uint64_t size) {
             LazyBase *lazy = NULL;
             uint64_t wf = 0;   // the fence written back
             if (lost_on > 1 || __atomic_load_n(&n_mbase, __ATOMIC_ACQUIRE)) {
+                hang_mark("write-back: shadow_lock (bases)");
                 plat_mutex_lock(&shadow_lock);
                 spend_take();
                 int i = spend_oldest(addr, addr + size);
@@ -194,17 +199,20 @@ void vk_gpu_written(uint64_t addr, uint64_t size) {
                 if (mbase) n_mbase--;
                 plat_mutex_unlock(&shadow_lock);
             }
+            hang_mark("write-back: lost bases");
             if (base && mbase) free(base);   // merged: the write-back reverts nothing
             else if (base) lost_writeback(addr, size, r->smap + (addr - r->import_lo), base);
             int copied = 0;
             if (mbase) {   // merged: the GPU's bytes now, the CPU's stay
+                hang_mark("write-back: merge");
                 mem_early_wb_check(addr, size, wf);   // MKW_EARLY_READ_DRY: a later writer running meanwhile
                 wb = merge_back(addr, size, r->smap + (addr - r->import_lo), mbase, lazy);
                 if (lazy) lazy_free(lazy);
                 else free(mbase);
                 if (watch_hi) watch_event("write-back merged", addr, addr + size, 0, wb);
             } else if ((copied = !read_traps || !mem_trap(addr, size, r->smap + (addr - r->import_lo)))) {
-                mem_thaw(addr, size);
+                hang_mark("write-back: thaw and copy");
+                mem_thaw_wb(addr, size);
                 memcpy((void *)(uintptr_t)addr, r->smap + (addr - r->import_lo), size);
                 wb = size;
                 if (watch_hi) watch_event("write-back copied", addr, addr + size, 0, wb);
@@ -212,6 +220,7 @@ void vk_gpu_written(uint64_t addr, uint64_t size) {
         }
         if (r) vk_pool_diag_note(r->flags, 2, wb);
         int defer = RT_KNOB_ON(wb_defer);
+        hang_mark("write-back: shadow_lock (done)");
         if (defer && !plat_mutex_trylock(&shadow_lock)) {
             plat_mutex_lock(&sdone_lock);
             if (nsdone == csdone) vk_mem_grow((void **)&sdone, &csdone, sizeof *sdone);
@@ -226,6 +235,7 @@ void vk_gpu_written(uint64_t addr, uint64_t size) {
             plat_mutex_unlock(&shadow_lock);
         }
         plat_mutex_unlock_shared(&pool_lock);
+        hang_mark(hm);
     }
     vk_gpu_written_stamp(addr, size);
 }

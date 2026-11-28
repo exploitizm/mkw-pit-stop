@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "hangwatch.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
@@ -78,10 +79,12 @@ static void cb_done(void *arg) {   // completion thread
     int nown = 0;
     for (int i = 0; i < r->nwritten; i++)
         if (r->written[i].own) wbytes += r->written[i].size, nown++;
+    const char *hm = hang_mark("cb_done: write-backs");   // MKW_STALL_TRACE (hangwatch.c)
     if (nown >= 4 && wbytes >= (256u << 10)) vk_wb_par(r->nwritten, written_one, r);
     else
         for (int i = 0; i < r->nwritten; i++)
             if (r->written[i].own) vk_gpu_written(r->written[i].addr, r->written[i].size);
+    hang_mark("cb_done: pools and chunks");
     for (int i = 0; i < r->npools; i++) {
         vkResetDescriptorPool(c->device, r->pools[i], 0);
         plat_mutex_lock(&spare_lock);
@@ -105,6 +108,7 @@ static void cb_done(void *arg) {   // completion thread
         if (!kept) vmaDestroyBuffer(c->vma, r->db_chunks[i].buf, r->db_chunks[i].alloc);
     }
     free(r->written), free(r->wslot), free(r->pools), free(r->chunks), free(r->db_chunks), free(r);
+    hang_mark(hm);
 }
 
 CbRes *cb_res_new(VkExec *ex) {

@@ -964,7 +964,9 @@ void vk_astc_batch_flush(void) {
 
     n_dispatch += (uint64_t)n_rg;
     vk_upload_end();
-    ar_ns[1] += plat_now_ns() - t0;
+    uint64_t dt = plat_now_ns() - t0;
+    ar_ns[1] += dt;
+    perf_ledger(PERF_LG_ASTC, dt);
 }
 
 void vk_astc_batch_end(void) {
@@ -1016,7 +1018,9 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
             memcpy(ab_rg + ab_nr, rg0, (size_t)n0 * sizeof *rg0);
             ab_nr += n0, ab_in += i_in, ab_out += i_out, ab_bc += i_bc;
             vk_upload_work(cb, i_out / 4);
-            ar_ns[0] += plat_now_ns() - ar_t0, ar_n++;
+            uint64_t dt = plat_now_ns() - ar_t0;
+            ar_ns[0] += dt, ar_n++;
+            perf_ledger(PERF_LG_ASTC, dt);
             return 1;
         }
     }
@@ -1252,6 +1256,7 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     if (!fixed) vk_defer_buffer_in(svma(), sb, sa);
     uint64_t ar_t3 = plat_now_ns();
     ar_ns[0] += ar_t1 - ar_t0, ar_ns[1] += ar_t2 - ar_t1, ar_ns[2] += ar_t3 - ar_t2, ar_n++;
+    perf_ledger(PERF_LG_ASTC, ar_t3 - ar_t0);
     return 1;
 }
 

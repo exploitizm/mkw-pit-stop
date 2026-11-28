@@ -138,6 +138,7 @@ static struct {
     uint64_t n_inpass;    // chunks cut inside a pass (at twice their draws without a target change)
     uint64_t n_qcut;      // chunks cut at a queue switch
     uint64_t n_pre, pre_ns;   // slots checked ahead, and the time (precheck)
+    uint64_t n_pre_par;       // of them, checked clean in parallel (MKW_PRECHECK_PAR)
     uint64_t pre_texlock_ns, pre_snap_ns, pre_q_ns, pre_lock_ns, pre_up_n, pre_up_ns;   // MKW_TRACE=perf: its split
     // where the first send waits (summed over submissions): chunk 0's draws, walk start to its hand-out, to its record
     uint64_t t_walk, ch0_draws, ch0_pub_ns, ch0_rdy_ns;
@@ -237,11 +238,18 @@ static void precheck(void) {
     int do_yield = RT_KNOB_ON(yield_k);
     uint64_t t0 = kern_now_ns();
     uint64_t s0 = vk_pc_snap_ns, u0 = vk_pc_up_n, un0 = vk_pc_up_ns, q0 = vk_snap_q_ns, l0 = vk_snap_lock_ns;
+    int pre_from0 = P.pre_from;
     uint64_t tl0 = kern_now_ns();
     uint32_t ep = vk_texture_epoch();
     vk_texture_lock();
     uint64_t hold_t0 = kern_now_ns();
     P.pre_texlock_ns += hold_t0 - tl0;
+    uint64_t tl_wait_ns = hold_t0 - tl0;
+    // MKW_PRECHECK_PAR (default 0, 1 in the PS5 profile: cfg.c has the A/B; "ab"): the clean checks first, in
+    // parallel (vk_tex_slots.c)
+    static int par_k = -1;
+    if (par_k < 0) par_k = rt_knob("PRECHECK_PAR", "0");
+    if (RT_KNOB_ON(par_k)) P.n_pre_par += (uint64_t)vk_texture_precheck_par(P.tids + P.pre_from, P.ntid - P.pre_from, ep);
     vk_astc_batch_begin();
     uint64_t last_up = vk_pc_up_n;
     int checked_since = 0;
@@ -257,6 +265,7 @@ static void precheck(void) {
                 vk_texture_lock();
                 hold_t0 = kern_now_ns();
                 P.pre_texlock_ns += hold_t0 - rt0;
+                tl_wait_ns += hold_t0 - rt0;
                 last_up = vk_pc_up_n;
                 checked_since = 0;
             }
@@ -265,7 +274,24 @@ static void precheck(void) {
     vk_astc_batch_end();
     vk_texture_unlock();
     P.pre_from = P.ntid;
-    P.pre_ns += kern_now_ns() - t0;
+    uint64_t pre_dt = kern_now_ns() - t0;
+    P.pre_ns += pre_dt;
+    perf_ledger(PERF_LG_PRECHECK, pre_dt);
+    // MKW_TRACE=perf: a pass of 10 ms or more, split (a 56 ms one at a race's pool churn, 28/11/2026)
+    if ((rt_trace & RT_TRACE_PERF) && pre_dt >= 10000000ull) {
+        static volatile int32_t logged;
+        uint64_t rn = 0, rns = 0, cn = 0, cns = 0;
+        vk_texture_resolve_stats(&rn, &rns, &cn, &cns);
+        if (__atomic_add_fetch(&logged, 1, __ATOMIC_RELAXED) <= 200)
+            rt_log("perf: slow precheck %.1f ms: %d slots, uploads %llu in %.1f ms, snapshot answers %.1f ms, texture lock "
+                   "%.1f ms; slots resolved again %llu in %.1f ms (new entries %llu in %.1f ms)", pre_dt / 1e6,
+                   P.ntid - pre_from0, (unsigned long long)(vk_pc_up_n - u0), (vk_pc_up_ns - un0) / 1e6,
+                   (vk_pc_snap_ns - s0) / 1e6, (double)tl_wait_ns / 1e6, (unsigned long long)rn, rns / 1e6,
+                   (unsigned long long)cn, cns / 1e6);
+    } else if (rt_trace & RT_TRACE_PERF) {
+        uint64_t a_, b_, c_, d_;
+        vk_texture_resolve_stats(&a_, &b_, &c_, &d_);   // (a pass's own: reset at each)
+    }
     P.pre_snap_ns += vk_pc_snap_ns - s0, P.pre_up_n += vk_pc_up_n - u0, P.pre_up_ns += vk_pc_up_ns - un0;
     P.pre_q_ns += vk_snap_q_ns - q0, P.pre_lock_ns += vk_snap_lock_ns - l0;
 }
@@ -925,6 +951,8 @@ int vk_exec_par(VkExec *ex, const uint64_t *handles, int n, int diag) {
     vk_exec_draw_new_cb();
     vk_exec_qs = P.wq;   // (the next part of a queue order episode goes on from them)
     P.n_par++, P.n_chunks += (uint64_t)P.nch, P.n_draws += (uint64_t)P.plan_draws, P.walk_ns += t1 - t0, P.rec_ns += t2 - t1;
+    perf_ledger(PERF_LG_RWALK, t1 - t0), perf_ledger(PERF_LG_RCHUNKS, t2 - t1);
+    perf_ledger(PERF_LG_DRAWS, (uint64_t)P.plan_draws);
     if (t2 - t1 > P.max_rec_ns) P.max_rec_ns = t2 - t1;
     return 1;
 }
@@ -943,7 +971,7 @@ void vk_exec_par_log(void) {
                "first send %.2f ms after the chunks start (a submission); "
                "uniform snapshot drops before the last chunk %llu, chunks recorded again for them %llu; conditions decided by the walk %llu; "
                "cuts inside a pass %.1f, at a queue switch %.1f a submission (MKW_REPLAY_PAR_INPASS); "
-               "slots checked ahead %.0f per frame in %.3f ms (MKW_REPLAY_PAR_PRECHECK); "
+               "slots checked ahead %.0f per frame in %.3f ms (MKW_REPLAY_PAR_PRECHECK), %.0f clean in parallel (MKW_PRECHECK_PAR); "
                "chunks handed out during the walk in %llu submissions (MKW_REPLAY_PAR_PIPE); first chunk %.0f draws, "
                "handed out %.2f ms after the walk began and recorded %.2f ms after that; "
                "serial heads %llu of %.0f draws in %.2f ms (MKW_REPLAY_PAR_HEAD)", (unsigned long long)P.n_par,
@@ -958,6 +986,7 @@ void vk_exec_par_log(void) {
                P.n_par ? (double)P.first_ns / 1e6 / (double)P.n_par : 0, (unsigned long long)P.drops_early, (unsigned long long)P.n_again,
                (unsigned long long)P.n_cond, P.n_par ? (double)P.n_inpass / (double)P.n_par : 0,
                P.n_par ? (double)P.n_qcut / (double)P.n_par : 0, (double)P.n_pre / (double)nf, (double)P.pre_ns / 1e6 / (double)nf,
+               (double)P.n_pre_par / (double)nf,
                (unsigned long long)P.n_pipe, P.n_par ? (double)P.ch0_draws / (double)P.n_par : 0,
                P.n_par ? (double)P.ch0_pub_ns / 1e6 / (double)P.n_par : 0, P.n_par ? (double)P.ch0_rdy_ns / 1e6 / (double)P.n_par : 0,
                (unsigned long long)P.n_head, P.n_head ? (double)P.head_ndraws / (double)P.n_head : 0,
@@ -977,7 +1006,7 @@ void vk_exec_par_log(void) {
     }
     P.pre_texlock_ns = P.pre_snap_ns = P.pre_q_ns = P.pre_lock_ns = P.pre_up_n = P.pre_up_ns = 0;
     P.walk_ns = P.rec_ns = P.max_rec_ns = P.first_ns = P.n_par = P.n_chunks = P.n_draws = P.drops_early = P.w_subs = P.n_cond = P.n_again = 0;
-    P.n_inpass = P.n_qcut = P.n_pre = P.pre_ns = P.n_pipe = P.ch0_draws = P.ch0_pub_ns = P.ch0_rdy_ns = 0;
+    P.n_inpass = P.n_qcut = P.n_pre = P.n_pre_par = P.pre_ns = P.n_pipe = P.ch0_draws = P.ch0_pub_ns = P.ch0_rdy_ns = 0;
     P.n_head = P.head_ndraws = P.head_ns = 0;
     memset(P.n_serial, 0, sizeof P.n_serial);
 }

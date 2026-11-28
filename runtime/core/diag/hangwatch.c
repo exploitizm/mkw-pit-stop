@@ -172,8 +172,88 @@ static void watch_main(void *arg) {
     }
 }
 
+// ---- MKW_STALL_TRACE=<ms> (default 0, off): what every thread's checkpoint was through each frame of <ms> or more.
+// A sampler thread reads every slot's checkpoint once a millisecond into a ring of STALL_RING samples; a present that
+// comes <ms> or more after the previous one asks it for the frame's window, and it logs one line per thread with the
+// milliseconds spent at each checkpoint ("(none)": no checkpoint set, a guest thread running its own code or a runtime
+// thread between marks). Only the sampler touches the ring. For the 50-90 ms frames of the PS5 race whose cost ledger
+// shows only 8-10 ms of replay and nothing else (28/11/2026): which thread the frame waited on, and on what.
+#define STALL_RING 256
+static const char *st_ring[STALL_RING][SLOTS];
+static uint64_t st_ts[STALL_RING];
+static uint32_t st_at;                         // samples taken (the sampler's)
+static uint64_t st_req_t0, st_req_t1, st_req_frame;   // atomic: a window to report (t1 set last)
+static uint64_t st_last_present;
+
+static void stall_dump(uint64_t t0, uint64_t t1, uint64_t frame) {
+    static int dumps;
+    if (dumps++ >= 80) return;
+    int n = __atomic_load_n(&nslots, __ATOMIC_ACQUIRE);
+    if (n > SLOTS) n = SLOTS;
+    uint32_t last = st_at;
+    rt_log("stall trace: frame %llu, %.1f ms (checkpoint ms by thread, one sample a ms):", (unsigned long long)frame,
+           (t1 - t0) / 1e6);
+    for (int i = 0; i < n; i++) {
+        const char *lab[6] = {0};
+        int cnt[6] = {0}, nl = 0, other = 0, total = 0;
+        for (uint32_t k = 0; k < STALL_RING && k < last; k++) {
+            uint32_t s = (last - 1 - k) % STALL_RING;
+            if (st_ts[s] < t0) break;
+            if (st_ts[s] > t1) continue;
+            const char *w = st_ring[s][i];
+            total++;
+            int j = 0;
+            while (j < nl && lab[j] != w) j++;
+            if (j < nl) cnt[j]++;
+            else if (nl < 6) lab[nl] = w, cnt[nl++] = 1;
+            else other++;
+        }
+        if (!total) continue;
+        // a thread that sat at one idle checkpoint the whole frame says nothing about the stall
+        if (nl == 1 && lab[0] && (strstr(lab[0], "idle") || strstr(lab[0], "sleep"))) continue;
+        char line[600];
+        int o = snprintf(line, sizeof line, "stall trace:   %-16s tid %u:", slots[i].name, slots[i].tid);
+        for (int j = 0; j < nl && o < (int)sizeof line - 80; j++)
+            o += snprintf(line + o, sizeof line - (size_t)o, " %s %d;", lab[j] ? lab[j] : "(none)", cnt[j]);
+        if (other && o < (int)sizeof line - 30) snprintf(line + o, sizeof line - (size_t)o, " other %d", other);
+        rt_log("%s", line);
+    }
+}
+
+static void stall_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        plat_sleep_ns(1000000);
+        uint32_t s = st_at % STALL_RING;
+        int n = __atomic_load_n(&nslots, __ATOMIC_ACQUIRE);
+        if (n > SLOTS) n = SLOTS;
+        for (int i = 0; i < n; i++) st_ring[s][i] = __atomic_load_n(&slots[i].where, __ATOMIC_ACQUIRE);
+        st_ts[s] = plat_now_ns();
+        st_at++;
+        uint64_t t1 = __atomic_exchange_n(&st_req_t1, 0, __ATOMIC_ACQUIRE);
+        if (t1) stall_dump(__atomic_load_n(&st_req_t0, __ATOMIC_RELAXED), t1, __atomic_load_n(&st_req_frame, __ATOMIC_RELAXED));
+    }
+}
+
+static void stall_frame(uint64_t frame) {
+    static int64_t ms = -1;
+    if (ms < 0) {
+        const char *e = cfg_get("MKW_STALL_TRACE");
+        ms = e && *e ? atol(e) : 0;
+        if (ms > 0 && !plat_thread_spawn(stall_main, NULL, "stall trace", 0)) ms = 0;
+        if (ms > 0) rt_log("stall trace: each frame of %lld ms or more logs its threads' checkpoints (MKW_STALL_TRACE)", (long long)ms);
+    }
+    uint64_t now = plat_now_ns(), prev = st_last_present;
+    st_last_present = now;
+    if (ms <= 0 || !prev || now - prev < (uint64_t)ms * 1000000ull) return;
+    __atomic_store_n(&st_req_t0, prev, __ATOMIC_RELAXED);
+    __atomic_store_n(&st_req_frame, frame, __ATOMIC_RELAXED);
+    __atomic_store_n(&st_req_t1, now, __ATOMIC_RELEASE);
+}
+
 void hang_frame(uint64_t frame) {
     __atomic_store_n(&frame_seen, frame, __ATOMIC_RELEASE);
+    stall_frame(frame);
     if (__atomic_load_n(&started, __ATOMIC_RELAXED)) return;
     started = 1;   // the present thread only
 #ifdef __PROSPERO__

@@ -119,6 +119,14 @@ void merge_census_log(void) {
 // changed and the bytes copied (the difference is the CPU's, with cpu_wins).
 typedef struct { uint64_t lo, hi, gpu, copied; } MergeStat;
 
+// MKW_TRACE=perf: the thaws a merge makes (count, ns) on this thread, read by merge_back for a slow merge's line
+static _Thread_local uint64_t mt_n, mt_ns;
+static void thaw_timed(uint64_t a, uint64_t n) {
+    uint64_t t0 = qpc();
+    mem_thaw_wb(a, n);
+    mt_n++, mt_ns += qpc() - t0;
+}
+
 // Write-back of [addr, addr+size) from shadow s: the runs the GPU changed against base, a byte at a time (MKW_MERGE_SIMD=0,
 // and the reference --probe-merge checks merge_back_runs against).
 // With cw (MKW_SHADOW_CPU_WINS) a byte the CPU changed since the base (guest memory away from it) stays.
@@ -169,7 +177,7 @@ static void merge_back_bytes(uint64_t addr, uint64_t size, const uint8_t *s, con
                 if (y > thawed) {
                     uint64_t from = x > thawed ? x & ~0xfffull : thawed;
                     thawed = (y + 0xfff) & ~0xfffull;
-                    mem_thaw(from, thawed - from);
+                    thaw_timed(from, thawed - from);
                 }
                 memcpy((void *)(uintptr_t)x, s + k + a, b - a);
                 copied += b - a;
@@ -207,7 +215,7 @@ static void run_flush(RunOut *o) {
     if (y > o->thawed) {   // once a page, as merge_back_bytes: mem_thaw takes frz_lock
         uint64_t from = x > o->thawed ? x & ~0xfffull : o->thawed;
         o->thawed = (y + 0xfff) & ~0xfffull;
-        mem_thaw(from, o->thawed - from);
+        thaw_timed(from, o->thawed - from);
     }
     memcpy((void *)(uintptr_t)x, o->s + o->rs, o->re - o->rs);
     o->copied += o->re - o->rs;
@@ -310,12 +318,25 @@ uint64_t merge_back(uint64_t addr, uint64_t size, const uint8_t *s, const uint8_
     static int simd = -1;
     if (simd < 0) simd = rt_knob("MERGE_SIMD", "1");
     if (wbc_on < 0) wbc_on = rt_knob("WB_CENSUS", "0");
-    uint64_t t0 = wbc_on > 0 ? qpc() : 0;
+    int perf = (rt_trace & RT_TRACE_PERF) != 0;
+    uint64_t t0 = wbc_on > 0 || perf ? qpc() : 0;
+    mt_n = mt_ns = 0;
     MergeStat st;
     if (RT_KNOB_ON(simd) && merge_back_sliced(addr, size, s, base, lazy, cpu_wins(), &st)) {}
     else if (RT_KNOB_ON(simd)) merge_back_runs(addr, size, s, base, lazy, cpu_wins(), &st);
     else merge_back_bytes(addr, size, s, base, lazy, cpu_wins(), &st);
     if (wbc_on > 0) wbc_note(addr, size, st.lo, st.hi, st.gpu, st.gpu - st.copied, qpc() - t0);
+    // MKW_TRACE=perf: a merge of 5 ms or more (stall3, 28/11/2026: merges of 43-51 ms on the completion thread held the
+    // fence's waiters, the game's main thread, through the race's 70-90 ms frames); thaws on this thread only (a sliced
+    // merge's other threads make their own)
+    uint64_t dt = perf ? qpc() - t0 : 0;
+    if (perf && dt >= 5000000ull) {
+        static volatile int32_t logged;
+        if (__atomic_add_fetch(&logged, 1, __ATOMIC_RELAXED) <= 200)
+            rt_log("mem: slow merge %.1f ms at %#llx: %.1f KiB range, %.1f KiB changed by the GPU, %.1f KiB copied%s; "
+                   "thaws %llu in %.1f ms", qpc_ms(dt), (unsigned long long)addr, size / 1024.0, st.gpu / 1024.0,
+                   st.copied / 1024.0, lazy ? ", lazy base" : "", (unsigned long long)mt_n, qpc_ms(mt_ns));
+    }
     return st.copied;
 }
 

@@ -15,6 +15,7 @@
 #include "guest_layout.h"
 #include "platform.h"
 #include "ps5_guest_memory.h"
+#include "ps5_memory.h"
 #include "prot_watch.h"
 #include "memory_int.h"
 #include "host.h"
@@ -35,9 +36,32 @@ static void *reserve_at(uint64_t address, size_t bytes, int protection) {
     return p;
 }
 
+static uintptr_t windows[8][2];   // the system-chosen reservations: a unit is filled there, so it may be stale first
+static int nwindows;
+static bool in_window(uintptr_t a) {
+    for (int i = 0; i < nwindows; i++)
+        if (a >= windows[i][0] && a < windows[i][1]) return true;
+    return false;
+}
+
 int32_t sceKernelReserveVirtualRange(void **address, size_t bytes, int flags, size_t alignment) {
     uint64_t at = (uintptr_t)*address;
     assert(!flags && alignment == UNIT && !(at % UNIT) && !(bytes % UNIT));
+    if (!at) {   // the system's choice (the zero pool's and the fill's windows), aligned as asked
+        uint8_t *q = mmap(NULL, bytes + UNIT, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        assert(q != MAP_FAILED);
+        uint8_t *a = (uint8_t *)(((uintptr_t)q + UNIT - 1) & ~(uintptr_t)(UNIT - 1));
+        if (a > q) munmap(q, (size_t)(a - q));
+        munmap(a + bytes, (size_t)(q + bytes + UNIT - (a + bytes)));
+        *address = a;
+        if (nwindows < 8) windows[nwindows][0] = (uintptr_t)a, windows[nwindows++][1] = (uintptr_t)a + bytes;
+        return 0;
+    }
+    for (int i = 0; i < nwindows; i++)   // a window reserved again in place
+        if (at == windows[i][0]) {
+            *address = reserve_at(at, bytes, PROT_NONE);
+            return 0;
+        }
     if (at == hint) {
         *address = reserve_at(unexpected, bytes, PROT_NONE);
         pending = true;
@@ -138,7 +162,8 @@ int32_t sceKernelMapDirectMemory(void **address, size_t bytes, int protection, i
     assert((uintptr_t)*address != unexpected && (!foreign || (uintptr_t)*address != sample));
     // Nothing stale may be seen at the guest address, even for an instant: the unit is filled before this map.
     const uint64_t *w = (const uint64_t *)(phys + offset);
-    for (size_t k = 0; k < UNIT / sizeof *w; ++k) assert(w[k] != STALE);
+    if (in_window((uintptr_t)*address)) ++private_maps;   // the fill window's slot: the map that writes first contents
+    for (size_t k = 0; !in_window((uintptr_t)*address) && k < UNIT / sizeof *w; ++k) assert(w[k] != STALE);
     void *p = mmap(*address, bytes, protection, MAP_SHARED | MAP_FIXED, phys_fd, offset);
     assert(p == *address);
     return 0;
@@ -226,6 +251,9 @@ static void check_early_page(uint64_t addr, uint32_t prot, int early) {
 
 PlatMutex frz_lock;
 _Thread_local int frz_held;
+unsigned rt_trace;   // memory_int.h: frz_take notes frz_lock's holder only with MKW_TRACE=perf (memory.c)
+void frz_note(uintptr_t site) { (void)site; }
+void frz_unnote(void) {}
 uint8_t *trapped;
 
 static uint64_t test_watch_addr;
@@ -543,6 +571,79 @@ static void test_prot_watch_subpage(uint64_t addr) {
     puts("prot_watch_dirty: sub-16 KiB and tail-4 KiB spans report writes accurately");
 }
 
+// MKW_ZERO_POOL: a decommitted unit stays allocated in the pool; the next commit takes it zeroed (whether the pool's
+// thread zeroed it first or not) and allocates nothing; turned off, the pool gives every unit back. The build sets the
+// pool's memory thresholds to 0 and "never", so the model's 1 MiB neither trims it nor gets units allocated ahead.
+static unsigned live_allocations(void) { return __atomic_load_n(&allocations, __ATOMIC_ACQUIRE); }
+static uint64_t pool_ready(void) {
+    uint64_t st[7];
+    ps5_mem_zero_pool_stats(st);
+    return st[5];
+}
+static void test_zero_pool(uint64_t addr) {
+    assert(!ps5_mem_zero_pool(1));
+    unsigned before = live_allocations();
+    for (int round = 0; round < 2; round++) {
+        assert(plat_mem_commit(addr, 2 * UNIT) && plat_mem_back(addr, 2 * UNIT));
+        assert(live_allocations() == before + 2);
+        memset((void *)(uintptr_t)addr, 0x77, 2 * UNIT);
+        assert(plat_mem_decommit(addr, 2 * UNIT));
+        assert(live_allocations() == before + 2);   // kept, not released
+        if (!round)   // the first time the thread zeroes both first; the second time the commit may meet one unzeroed
+            for (int i = 0; i < 5000 && pool_ready() < 2; i++) plat_sleep_ns(1000000);
+        assert(plat_mem_commit(addr, 2 * UNIT) && plat_mem_back(addr, 2 * UNIT));
+        assert(live_allocations() == before + 2);   // taken from the pool
+        const uint64_t *w = (const uint64_t *)(uintptr_t)addr;
+        for (size_t k = 0; k < 2 * UNIT / sizeof *w; k++) assert(!w[k]);
+        assert(plat_mem_decommit(addr, 2 * UNIT));
+    }
+    assert(!ps5_mem_zero_pool(0));
+    for (int i = 0; i < 5000 && live_allocations() != before; i++) plat_sleep_ns(1000000);
+    assert(live_allocations() == before);
+    puts("zero pool: decommitted units recycled zeroed, no allocation; off gives them back");
+}
+
+// MKW_DECOMMIT_RUN: units with backing in a row released by one unmap, a half-covered unit page by page; the run's
+// pages read zero when committed again, its physical units are given back and its guest pages are reserved again.
+static void test_decommit_run(uint64_t addr) {
+    assert(!plat_mem_decommit_run_mode(1));
+    unsigned before = live_allocations();
+    assert(plat_mem_commit(addr, 4 * UNIT) && plat_mem_back(addr, 4 * UNIT));
+    assert(live_allocations() == before + 4);
+    memset((void *)(uintptr_t)addr, 0x5c, 4 * UNIT);
+    // three whole units and half of the fourth
+    assert(plat_mem_decommit(addr, 3 * UNIT + UNIT / 2));
+    assert(live_allocations() == before + 1);
+    state(addr, addr + 3 * UNIT + UNIT / 2, PLAT_MEM_RESERVED, addr + 3 * UNIT + UNIT / 2);
+    assert(((volatile uint8_t *)(uintptr_t)addr)[3 * UNIT + UNIT / 2] == 0x5c);   // the rest of the fourth kept
+    assert(plat_mem_commit(addr, 3 * UNIT) && plat_mem_back(addr, 3 * UNIT));
+    const uint64_t *w = (const uint64_t *)(uintptr_t)addr;
+    for (size_t k = 0; k < 3 * UNIT / sizeof *w; k++) assert(!w[k]);
+    assert(plat_mem_decommit(addr, 4 * UNIT));
+    assert(live_allocations() == before);
+    assert(!plat_mem_decommit_run_mode(0));
+    puts("decommit run: three units released by one unmap, a half unit page by page; zero when committed again");
+}
+
+// MKW_FILL_WINDOW: fresh units zeroed and packed units' bytes written through the shared window read the same at their
+// guest addresses; a unit decommitted while its slot still maps it is released only after the window's flush; off,
+// the window goes and nothing stays allocated.
+static void test_fill_window(uint64_t addr) {
+    assert(!ps5_mem_fill_window(1));
+    unsigned before = live_allocations();
+    for (int round = 0; round < 8; round++) {   // 8 x 6 units: past the window's 32 slots
+        assert(plat_mem_commit(addr, 6 * UNIT) && plat_mem_back(addr, 6 * UNIT));
+        const uint64_t *w = (const uint64_t *)(uintptr_t)addr;
+        for (size_t k = 0; k < 6 * UNIT / sizeof *w; k++) assert(!w[k]);
+        memset((void *)(uintptr_t)addr, 0x3d, 6 * UNIT);
+        assert(plat_mem_decommit(addr, 6 * UNIT));
+        assert(live_allocations() == before);
+    }
+    assert(ps5_mem_fill_window_flushes() >= 1);
+    assert(!ps5_mem_fill_window(0));
+    puts("fill window: 48 units zeroed through the window, released after its flushes, nothing left allocated");
+}
+
 static void test_memory(void) {
     uint64_t boundary = sample + UNIT, tail = boundary - PAGE;
     uint64_t alias_end = RT_ALIAS_BASE + RT_ALIAS_SIZE;
@@ -557,6 +658,9 @@ static void test_memory(void) {
     test_pack_watch(RT_ALIAS_BASE + 24 * UNIT);
     test_cold_census(RT_ALIAS_BASE + 32 * UNIT);
     test_prot_watch_subpage(RT_ALIAS_BASE + 48 * UNIT);
+    test_zero_pool(RT_ALIAS_BASE + 52 * UNIT);
+    test_decommit_run(RT_ALIAS_BASE + 56 * UNIT);
+    test_fill_window(RT_ALIAS_BASE + 64 * UNIT);
     assert(!allocations && !plat_mem_reserve(sample, UNIT, 0));
     assert(!plat_mem_reserve(hint, UNIT, 0));
     assert(!plat_mem_reserve(unexpected, UNIT, 0) && !plat_mem_commit(unexpected, PAGE));

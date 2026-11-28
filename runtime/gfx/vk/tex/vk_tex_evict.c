@@ -76,6 +76,7 @@ VkResult evict_idle(VkCtx *c, const VkImageCreateInfo *ci, const VmaAllocationCr
 uint64_t vk_texture_trim(uint64_t bytes) {
     VkCtx *c = vk_ctx();
     if (!c || !plat_rmutex_trylock(&tex_lock)) return 0;
+    TL_TOOK();
     uint64_t freed = 0;
     for (Tex *r; freed < bytes && (r = rel_oldest());) {
         VmaAllocationInfo vi = {0};
@@ -128,6 +129,7 @@ uint64_t vk_texture_trim_gov(uint64_t bytes) {
     }
     uint32_t idle = (uint32_t)idle_v;
     if (!plat_rmutex_trylock(&tex_lock)) return 0;
+    TL_TOOK();
     uint32_t cap = by_key.n + 1, n = 0;
     EvictCand *cand = malloc(sizeof *cand * cap);
     if (cand)
@@ -141,6 +143,7 @@ uint64_t vk_texture_trim_gov(uint64_t bytes) {
     uint64_t freed = 0;
     for (uint32_t k = 0; k < n && freed < bytes;) {
         if (!plat_rmutex_trylock(&tex_lock)) break;   // the replay holds it: the next pass carries on
+        TL_TOOK();
         for (uint32_t b = 0; b < GOV_EVICT_BATCH && k < n && freed < bytes; b++, k++) {
             Tex *e = nvn_hm_get(&by_key, &cand[k].key);   // looked up again: it may have gone or been used since
             if (!gov_evictable(e, idle)) continue;
@@ -158,6 +161,7 @@ uint64_t vk_texture_trim_gov(uint64_t bytes) {
 uint64_t vk_texture_trim_released(uint64_t keep_bytes) {
     VkCtx *c = vk_ctx();
     if (!c || !plat_rmutex_trylock(&tex_lock)) return 0;
+    TL_TOOK();
     uint64_t before = released_bytes;
     for (Tex *r; released_bytes > keep_bytes && (r = rel_oldest_droppable());)
         destroy_idle(r);
