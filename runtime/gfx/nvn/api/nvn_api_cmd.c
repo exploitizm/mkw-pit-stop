@@ -145,30 +145,38 @@ void cmd_copy_view(view_t *dst, uint8_t *has, const NVNtextureView *v) {
 // ---------- texture pins
 // Recordings refer to textures by pointer, but the game may finalize or reuse an NVNtexture after recording and before
 // the submit (NVN itself captured only GPU state). Records therefore point at an immutable host copy per texture
-// initialization (tex_t.serial). The copies are kept for the whole run (MacNativeGames sweeps them for long sessions).
+// initialization (tex_t.serial). Kept for the whole run in the upstream port; on the PS5 they grew ~1.8 MiB a minute in
+// races (run 67's allocation trace: cmd_tex_pin, +9 MiB in 5 min), so they are swept as MacNativeGames does
+// (nvn_pin_sweep_point below).
+static uint64_t nsubmits;   // defined with the recording copies below
+typedef struct { tex_t t; uint64_t last_pin, alive; } pin_t;   // t first: records hold (const tex_t *) pins
 static PlatMutex pin_lock = PLAT_MUTEX_INIT;
-static nvn_hmap pins = {.klen = 8};         // serial -> tex_t copy
+static nvn_hmap pins = {.klen = 8};         // serial -> pin_t
+static nvn_hmap pin_ptrs = {.klen = 8};     // pin_t address -> pin_t: marking by pointer without dereferencing one
 
 const tex_t *cmd_tex_pin(const NVNtexture *nt) {
     const tex_t *t = (const tex_t *)nt;
     if (!t) return NULL;
     uint64_t serial = t->serial;
     if (!serial) rt_fatal("nvn: a recording references the uninitialized texture object %p", (const void *)t);
+    uint64_t now = __atomic_load_n(&nsubmits, __ATOMIC_RELAXED);
     plat_mutex_lock_shared(&pin_lock);
-    const tex_t *r = nvn_hm_get(&pins, &serial);
+    pin_t *r = nvn_hm_get(&pins, &serial);
+    if (r) __atomic_store_n(&r->last_pin, now, __ATOMIC_RELAXED);   // a recording in progress holds it
     plat_mutex_unlock_shared(&pin_lock);
-    if (r) return r;
+    if (r) return &r->t;
     plat_mutex_lock(&pin_lock);
     r = nvn_hm_get(&pins, &serial);
     if (!r) {
-        tex_t *copy = malloc(sizeof *copy);
-        if (!copy) rt_fatal("nvn: texture pin copy");
-        *copy = *t;
-        nvn_hm_put(&pins, &serial, copy);
-        r = copy;
+        r = malloc(sizeof *r);
+        if (!r) rt_fatal("nvn: texture pin copy");
+        r->t = *t, r->last_pin = now, r->alive = 0;
+        nvn_hm_put(&pins, &serial, r);
+        uint64_t key = (uintptr_t)r;
+        nvn_hm_put(&pin_ptrs, &key, r);
     }
     plat_mutex_unlock(&pin_lock);
-    return r;
+    return &r->t;
 }
 
 // ---------- recording copies
@@ -178,7 +186,7 @@ const tex_t *cmd_tex_pin(const NVNtexture *nt) {
 // copies per page), and the recording threads waited on it.
 typedef struct { uint64_t magic, bytes, made_at, used_at, deferred; } copy_prefix;   // deferred: 0 unknown, 1 none, 2 some
 _Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
-typedef struct { uintptr_t lo, hi; uint8_t *copy; } cmd_copy;
+typedef struct { uintptr_t lo, hi; uint8_t *copy; uint32_t token; } cmd_copy;   // token: its mark is in control memory
 typedef struct { cmd_copy *v; uint32_t n, cap; } copy_bucket;
 static PlatMutex copy_lock = PLAT_MUTEX_INIT;    // guards the two maps, the counters and every prefix
 static nvn_hmap copy_pages = {.klen = 8};   // page -> copy_bucket
@@ -263,7 +271,7 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
     return out + sizeof(copy_prefix);
 }
 
-static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
+static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy, int token) {
     copy_prefix *pf = (copy_prefix *)copy - 1;
     uint64_t handle = (uintptr_t)copy;
     uintptr_t page = lo >> COPY_PAGE_SHIFT;
@@ -280,7 +288,7 @@ static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
         b->v = realloc(b->v, b->cap * sizeof *b->v);
         if (!b->v) rt_fatal("nvn: command copy index");
     }
-    b->v[b->n++] = (cmd_copy){lo, hi, copy};
+    b->v[b->n++] = (cmd_copy){lo, hi, copy, (uint32_t)token};
     nvn_hm_put(&copy_live, &handle, pf);
     ncopies++;
     copy_bytes += pf->bytes;
@@ -319,6 +327,294 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
         }
     }
     plat_mutex_unlock(&copy_lock);
+}
+
+// Ported to this runtime by extoverflow/mkw-recomp 4f3dda83 (MIT), cherry-picked onto the fork's main 27/11/2026.
+// Copy marks (MacNativeGames games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c @ b75be8cf, lines 850-882 and 1150-1170,
+// MIT, Copyright (c) 2026 jhaizhou): a recording copy also goes when the game reuses its control memory for something
+// else. The driver's handle lives in the recorder's control memory (sdk+0x444530), so a game that overwrites or frees
+// that memory has no valid handle left. EndRecording writes a mark (this magic and the copy's address) into the 64 bytes
+// of control memory it reports as used; the sweep releases a copy whose mark is gone. Without it a copy went only when
+// the same control memory was added again: on the PS5 the live copies grew ~3.5 MiB a minute in races (run 67's
+// allocation trace: flatten_recording, +17.5 MiB in 5 min), the largest share of the title heap's growth.
+// Divergences: the mark is read only where the page is committed and readable (plat_mem_state under mem_hold_layout)
+// instead of under a fault guard, and a page no longer committed counts as gone; one whole walk every
+// COPY_SWEEP_SUBMITS on the submitting thread instead of windows on the replay thread; a released copy that a queued
+// submission still reads goes to the zombies (asynchronous replay), so marks stay on with it. MKW_COPY_MARKS=0: off.
+#define COPY_MARK_MAGIC 0x4e454b4f54594d43ull
+#define COPY_SWEEP_SUBMITS 600
+static uint64_t copies_marked, copy_drop_mark, copy_drop_gone, copy_sweeps;
+
+// "ab": marks written and swept in the B blocks only (MKW_AB), to measure the sweeps' cost in one run.
+static int copy_marks_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = rt_knob("COPY_MARKS", "1");
+        rt_log("nvn: recording copy marks %s (MKW_COPY_MARKS)", v == 2 ? "ab: in the B blocks only"
+                                                              : v ? "on: a copy goes when the game overwrites its control memory"
+                                                                  : "off: copies go only when their control memory is added again");
+    }
+    return RT_KNOB_ON(v);
+}
+
+static void copy_mark_write(uintptr_t at, const uint8_t *copy) {
+    uint64_t v[2] = {COPY_MARK_MAGIC, (uint64_t)(uintptr_t)copy};
+    memcpy((void *)at, v, sizeof v);
+}
+
+// 1: the mark is there; 0: overwritten or the memory is gone. mem_hold_layout held.
+static int copy_mark_intact(const cmd_copy *k) {
+    uint64_t end, a = k->lo & ~0xfffull;
+    int st = plat_mem_state(a, a + 0x1000, &end);
+    if (st != PLAT_PROT_READ && st != PLAT_PROT_RW) return st == PLAT_PROT_NONE;   // no access: unknown, kept
+    if ((k->lo & 0xfff) + 16 > 0x1000) {   // the mark crosses into the next page
+        st = plat_mem_state(a + 0x1000, a + 0x2000, &end);
+        if (st != PLAT_PROT_READ && st != PLAT_PROT_RW) return st == PLAT_PROT_NONE;
+    }
+    uint64_t v[2];
+    memcpy(v, (const void *)k->lo, sizeof v);
+    return v[0] == COPY_MARK_MAGIC && v[1] == (uint64_t)(uintptr_t)k->copy;
+}
+
+static void copy_mark_sweep(void) {
+    if (!copy_marks_on()) return;
+    uint64_t t0 = plat_now_ns(), replayed = gfx_replayed_submits(), dropped = 0, gone = 0;
+    plat_mutex_lock(&copy_lock);
+    if (nzombies) zombie_sweep(replayed);
+    mem_hold_layout();
+    uint64_t *empty = NULL;
+    uint32_t nempty = 0, cempty = 0;
+    for (uint32_t s = 0; s < copy_pages.cap; s++) {
+        copy_bucket *b = copy_pages.vals[s];
+        if (!b) continue;
+        for (uint32_t i = 0; i < b->n;) {
+            cmd_copy *k = &b->v[i];
+            if (!k->token || copy_mark_intact(k)) { i++; continue; }
+            uint64_t end;
+            if (plat_mem_state(k->lo & ~0xfffull, (k->lo & ~0xfffull) + 0x1000, &end) < PLAT_PROT_NONE) gone++;
+            uint64_t handle = (uintptr_t)k->copy;
+            copy_prefix *pf = (copy_prefix *)k->copy - 1;
+            nvn_hm_del(&copy_live, &handle);
+            ncopies--;
+            copy_bytes -= pf->bytes;
+            pf->magic = 0;
+            if (pf->used_at > replayed) zombie_add(pf);   // a queued submission still reads it
+            else free(pf);
+            b->v[i] = b->v[--b->n];
+            dropped++;
+        }
+        if (!b->n) {   // deleted after the walk: deleting moves other entries
+            if (nempty == cempty) {
+                cempty = cempty ? cempty * 2 : 64;
+                empty = realloc(empty, cempty * sizeof *empty);
+                if (!empty) rt_fatal("nvn: out of memory (copy sweep)");
+            }
+            memcpy(&empty[nempty++], copy_pages.keys + (size_t)s * copy_pages.klen, sizeof *empty);
+        }
+    }
+    mem_release_layout();
+    for (uint32_t i = 0; i < nempty; i++) {
+        copy_bucket *b = nvn_hm_del(&copy_pages, &empty[i]);
+        if (b) free(b->v), free(b);
+    }
+    free(empty);
+    copy_drop_mark += dropped, copy_drop_gone += gone;
+    if (++copy_sweeps <= 8 || !(copy_sweeps & (copy_sweeps - 1)))
+        rt_log("nvn: recording copy sweep %llu: %llu released (%llu in memory no longer committed), %llu live, %.1f MiB; "
+                "%llu released by marks so far, %.2f ms", (unsigned long long)copy_sweeps, (unsigned long long)dropped,
+                (unsigned long long)gone, (unsigned long long)ncopies, copy_bytes / 1048576.0,
+                (unsigned long long)copy_drop_mark, (plat_now_ns() - t0) / 1e6);
+    plat_mutex_unlock(&copy_lock);
+}
+
+// Pin sweep (MacNativeGames hle_nvn.c @ b75be8cf, lines 1066-1215, MIT, Copyright (c) 2026 jhaizhou): a mark-and-sweep
+// every PIN_SWEEP_SUBMITS. A pin is alive when a live recording copy, a copy or clone a queued submission still reads
+// (the zombies), or the replay's render targets refer to it, or it was pinned in the last two windows (a recording in
+// progress); it goes after two sweeps in a row without a mark. Divergences: one whole walk per window instead of
+// slices; pointers are marked through pin_ptrs only (a record's texture pointer that is not a pin is ignored);
+// MKW_PIN_SWEEP=0 turns it off.
+//
+// Off the replay thread, and pin_lock held only briefly. As ported (extoverflow 4f3dda83) the sweep ran where the
+// replay finished a submission, holding pin_lock exclusively through the walk of every live copy: 4.9 ms median, 14.75
+// ms worst, on the replay thread (koA, 27/11/2026), while the game's recording threads, which take pin_lock shared on
+// every texture they reference (cmd_tex_pin), waited. Now the replay thread only copies its render targets
+// (vk_exec_pin_refs, a few dozen pointers) and wakes the "pin sweep" thread, which collects the pointers the copies
+// and zombies refer to into a set of its own under copy_lock shared, as before, then takes pin_lock exclusively for
+// one pass over the pins against that set. A recording made after the collection refreshes its pins' last_pin
+// (cmd_tex_pin), so the two-window rule keeps them: nothing it refers to can be swept.
+#define PIN_SWEEP_SUBMITS 600
+#define PIN_REFS_MAX 1024
+static uint64_t pin_sweep_id = 1, pins_freed, pin_sweeps;
+void vk_exec_pin_refs(void (*mark)(const void *)) __attribute__((weak));   // vk_exec.c: the targets the replay keeps
+
+typedef struct { uint64_t *v; uint32_t cap, n; } ptr_set;   // open addressing; 0 is empty
+static void set_add(ptr_set *s, uint64_t k) {
+    if (!k) return;
+    if ((s->n + 1) * 2 > s->cap) {   // grow, keeping it under half full
+        uint32_t cap = s->cap ? s->cap * 2 : 4096;
+        uint64_t *v = calloc(cap, sizeof *v);
+        if (!v) rt_fatal("nvn: out of memory (pin sweep)");
+        for (uint32_t i = 0; i < s->cap; i++)
+            if (s->v[i])
+                for (uint32_t h = (uint32_t)((s->v[i] >> 4) * 0x9E3779B97F4A7C15ull >> 32) & (cap - 1);; h = (h + 1) & (cap - 1))
+                    if (!v[h]) { v[h] = s->v[i]; break; }
+        free(s->v);
+        s->v = v, s->cap = cap;
+    }
+    for (uint32_t h = (uint32_t)((k >> 4) * 0x9E3779B97F4A7C15ull >> 32) & (s->cap - 1);; h = (h + 1) & (s->cap - 1)) {
+        if (s->v[h] == k) return;
+        if (!s->v[h]) { s->v[h] = k, s->n++; return; }
+    }
+}
+static int set_has(const ptr_set *s, uint64_t k) {
+    if (!s->cap || !k) return 0;
+    for (uint32_t h = (uint32_t)((k >> 4) * 0x9E3779B97F4A7C15ull >> 32) & (s->cap - 1);; h = (h + 1) & (s->cap - 1)) {
+        if (s->v[h] == k) return 1;
+        if (!s->v[h]) return 0;
+    }
+}
+
+static ptr_set *collect_to;   // the sweeper thread's, while it collects (one sweep at a time)
+static void pin_collect(const void *p) { set_add(collect_to, (uintptr_t)p); }
+
+static void pin_collect_ops(ptr_set *s, const uint8_t *p, uint64_t bytes) {   // one recording, OP_BEGIN ... OP_END
+    for (uint64_t at = 0; at + sizeof(op_hdr) <= bytes;) {
+        op_hdr h;
+        memcpy(&h, p + at, sizeof h);
+        if (h.size < 8 || at + h.size > bytes) break;
+        const uint8_t *a = p + at + sizeof h;
+        switch (h.op) {
+        case OP_SET_RT: {
+            const p_set_rt *r = (const void *)a;
+            for (int i = 0; i < 8; i++) set_add(s, (uintptr_t)r->color[i]);
+            set_add(s, (uintptr_t)r->depth);
+            break;
+        }
+        case OP_COPY_B2T: case OP_COPY_T2B: set_add(s, (uintptr_t)((const p_copy_b2t *)(const void *)a)->tex); break;
+        case OP_CLEAR_TEX: set_add(s, (uintptr_t)((const p_clear_tex *)(const void *)a)->tex); break;
+        case OP_COPY_T2T: {
+            const p_copy_t2t *c = (const void *)a;
+            set_add(s, (uintptr_t)c->src), set_add(s, (uintptr_t)c->dst);
+            break;
+        }
+        default: break;
+        }
+        if (h.op == OP_END) break;
+        at += h.size;
+    }
+}
+
+// "ab": sweeps in the B blocks only (MKW_AB).
+static int pin_sweep_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = rt_knob("PIN_SWEEP", "1");
+        rt_log("nvn: texture pin sweep %s (MKW_PIN_SWEEP)", v == 2 ? "ab: in the B blocks only" : v ? "on" : "off: pins kept for the run");
+    }
+    return RT_KNOB_ON(v);
+}
+
+// Handed from the replay thread to the sweeper: the replay's render targets at the sweep point.
+static PlatMutex sweep_lock = PLAT_MUTEX_INIT;
+static PlatEvent sweep_ev;
+static uint64_t sweep_refs[PIN_REFS_MAX];
+static uint32_t nsweep_refs, sweep_refs_lost;
+static int sweep_pending;
+static void ref_take(const void *p) {   // sweep_lock held
+    if (nsweep_refs < PIN_REFS_MAX) sweep_refs[nsweep_refs++] = (uintptr_t)p;
+    else sweep_refs_lost = 1;
+}
+
+static void pin_sweep(void) {
+    uint64_t t0 = plat_now_ns(), freed = 0, recent = 0;
+    ptr_set refs = {0};
+    plat_mutex_lock(&sweep_lock);
+    collect_to = &refs;
+    for (uint32_t i = 0; i < nsweep_refs; i++) pin_collect((const void *)(uintptr_t)sweep_refs[i]);
+    int lost = sweep_refs_lost;   // the replay held more targets than were copied: keep every pin this time
+    nsweep_refs = 0, sweep_refs_lost = 0, sweep_pending = 0;
+    plat_mutex_unlock(&sweep_lock);
+    plat_mutex_lock_shared(&copy_lock);
+    for (uint32_t i = 0; i < copy_live.cap; i++) {
+        copy_prefix *pf = copy_live.vals[i];
+        if (pf) pin_collect_ops(&refs, (const uint8_t *)(pf + 1), pf->bytes);
+    }
+    for (uint32_t i = 0; i < nzombies; i++) pin_collect_ops(&refs, (const uint8_t *)(zombies[i] + 1), zombies[i]->bytes);
+    plat_mutex_unlock_shared(&copy_lock);
+    uint64_t t1 = plat_now_ns();
+    uint64_t *gone = NULL;
+    uint32_t ngone = 0, cgone = 0;
+    plat_mutex_lock(&pin_lock);
+    uint64_t now = __atomic_load_n(&nsubmits, __ATOMIC_RELAXED);   // after the collection: pins used since are recent
+    pin_sweep_id++;
+    for (uint32_t i = 0; i < pin_ptrs.cap; i++) {
+        pin_t *r = pin_ptrs.vals[i];
+        if (!r) continue;
+        if (lost || set_has(&refs, (uintptr_t)r)) r->alive = pin_sweep_id;
+        if (__atomic_load_n(&r->last_pin, __ATOMIC_RELAXED) + 2 * PIN_SWEEP_SUBMITS > now) { r->alive = pin_sweep_id; recent++; }
+        if (r->alive + 1 >= pin_sweep_id) continue;   // marked in this sweep or the last one
+        if (ngone == cgone) {
+            cgone = cgone ? cgone * 2 : 256;
+            gone = realloc(gone, cgone * sizeof *gone);
+            if (!gone) rt_fatal("nvn: out of memory (pin sweep)");
+        }
+        gone[ngone++] = (uintptr_t)r;
+    }
+    for (uint32_t i = 0; i < ngone; i++) {   // deleted after the walk: deleting moves other entries
+        pin_t *r = nvn_hm_del(&pin_ptrs, &gone[i]);
+        if (!r) continue;
+        uint64_t serial = r->t.serial;
+        if (nvn_hm_get(&pins, &serial) == r) nvn_hm_del(&pins, &serial);
+        free(r);
+        freed++;
+    }
+    uint32_t live = pin_ptrs.n;
+    plat_mutex_unlock(&pin_lock);
+    uint64_t t2 = plat_now_ns();
+    free(gone);
+    free(refs.v);
+    pins_freed += freed;
+    if (++pin_sweeps <= 8 || !(pin_sweeps & (pin_sweeps - 1)))
+        rt_log("nvn: texture pin sweep %llu at submit %llu: %llu freed (%llu so far), %u live (%llu recent), %u pointers "
+               "referenced; %.2f ms collecting, pin_lock held %.2f ms (pin sweep thread)",
+               (unsigned long long)pin_sweeps, (unsigned long long)now, (unsigned long long)freed,
+               (unsigned long long)pins_freed, live, (unsigned long long)recent, refs.n, (t1 - t0) / 1e6,
+               (t2 - t1) / 1e6);
+}
+
+static void pin_sweeper(void *arg) {
+    (void)arg;
+    plat_thread_background();   // off the frame's fast cores (MKW_FAST_CORES)
+    plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
+    for (;;) {
+        plat_event_wait(&sweep_ev);
+        pin_sweep();
+    }
+}
+
+static void sweeper_start(void *arg) {
+    (void)arg;
+    plat_event_init(&sweep_ev, 0, 0);
+    if (!plat_thread_new(pin_sweeper, NULL, "pin sweep")) rt_log("nvn: no pin sweep thread: pins kept for the run");
+}
+
+// Where the replay finished a submission (vk_backend.c): every PIN_SWEEP_SUBMITS, its render targets are copied for the
+// sweeper thread, which is woken. A few dozen pointers: nothing else is done here.
+void nvn_pin_sweep_point(void) {
+    static uint64_t next = PIN_SWEEP_SUBMITS;
+    static PlatOnce once = PLAT_ONCE_INIT;
+    uint64_t now = __atomic_load_n(&nsubmits, __ATOMIC_RELAXED);
+    if (now < next || !pin_sweep_on()) return;
+    next = now + PIN_SWEEP_SUBMITS;
+    plat_once(&once, sweeper_start, NULL);
+    plat_mutex_lock(&sweep_lock);
+    if (!sweep_pending) {   // the last one is still running: this window is skipped
+        nsweep_refs = 0, sweep_refs_lost = 0;
+        if (vk_exec_pin_refs) vk_exec_pin_refs(ref_take);
+        sweep_pending = 1;
+        plat_event_set(&sweep_ev);
+    }
+    plat_mutex_unlock(&sweep_lock);
 }
 
 // ---------- CommandBuffer: object and memory
@@ -410,8 +706,10 @@ NVN_API(nvnCommandBufferEndRecording) {
     // Finalizing the recorder does not retire its handle; only reusing the control memory it was recorded in does.
     uintptr_t lo = (uintptr_t)o->ctl + (o->ctl_used < o->ctl_size ? o->ctl_used : 0);
     uintptr_t hi = o->ctl ? lo + 1 : 0;
+    int token = o->ctl && o->ctl_used + CTL_PER_RECORDING <= o->ctl_size && copy_marks_on();   // inside the game's memory only
     o->ctl_used += CTL_PER_RECORDING;
-    copy_add(lo, hi, copy);
+    if (token) copy_mark_write(lo, copy), copies_marked++;
+    copy_add(lo, hi, copy, token);
     ret_x(c, (uintptr_t)copy);
 }
 // NVNboolean nvnCommandBufferIsRecording(const NVNcommandBuffer *cmd)
@@ -660,6 +958,7 @@ void nvn_submit_prepare(const uint64_t *handles, int n) {
     nvn_sub_ndst = 0, early_watch = mem_early_on();
     memset(ssbo_dst, 0, sizeof ssbo_dst), nssbo_set = 0;
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
+    if (now % COPY_SWEEP_SUBMITS == 0) copy_mark_sweep();
     for (int i = 0; i < n; i++) copy_touch(handles[i], now, "QueueSubmitCommands");
     for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)(uintptr_t)handles[i], 0);
 }
@@ -671,6 +970,7 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
     nvn_sub_ndst = 0, early_watch = mem_early_on();
     memset(ssbo_dst, 0, sizeof ssbo_dst), nssbo_set = 0;
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
+    if (now % COPY_SWEEP_SUBMITS == 0) copy_mark_sweep();
     uint64_t replayed = gfx_replayed_submits();
     plat_mutex_lock(&copy_lock);
     if (nzombies) zombie_sweep(replayed);
