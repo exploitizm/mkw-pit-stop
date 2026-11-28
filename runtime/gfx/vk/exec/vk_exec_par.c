@@ -243,7 +243,8 @@ static void precheck(void) {
     vk_texture_lock();
     uint64_t hold_t0 = kern_now_ns();
     P.pre_texlock_ns += hold_t0 - tl0;
-    // MKW_PRECHECK_PAR (default 0 until measured, "ab"): the clean checks first, in parallel (vk_tex_slots.c)
+    // MKW_PRECHECK_PAR (default 0, 1 in the PS5 profile: cfg.c has the A/B; "ab"): the clean checks first, in
+    // parallel (vk_tex_slots.c)
     static int par_k = -1;
     if (par_k < 0) par_k = rt_knob("PRECHECK_PAR", "0");
     if (RT_KNOB_ON(par_k)) P.n_pre_par += (uint64_t)vk_texture_precheck_par(P.tids + P.pre_from, P.ntid - P.pre_from, ep);

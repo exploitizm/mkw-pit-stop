@@ -734,6 +734,11 @@ static const struct { const char *key, *value; } PS5[] = {
     // 1 % low 37.9 -> 40.5 and 36.5 -> 42.6 fps, 0.1 % low 21.0 -> 20.4 and 15.9 -> 29.2 fps, frame -0.10 ms balanced;
     // the write-watch fault storms behind the 1 % low's page-protection frames left B's slowest frames.
     {"MEMCPY_HOLD", "1"},
+    // The replay's precheck peeks its clean texture slots in parallel on the ASTC pool (vk_tex_slots.c
+    // vk_texture_precheck_par): in-race A/B, two 1.8.0 Grand Prix (pp-ab0 / pp-ab1, 28/11/2026), ~2,100 slots a frame,
+    // 1 % low 39.5 -> 41.3 and 38.3 -> 42.0 fps, frames over 20 ms 4.1 -> 2.7 % and 3.5 -> 3.2 %, frame unchanged; a
+    // race watched by the user with it on showed no stale texture.
+    {"PRECHECK_PAR", "1"},
     // The console's own controller: PlayStation icons rather than auto, which guesses from the pad's labels (Xbox when
     // it reports none), and the DualSense's vibration at 100 % (the table's 130 % suits PC pads; asked for by the user,
     // 24/11/2026). Both stay in Pit Stop > Controls.
