@@ -189,6 +189,8 @@ int mem_freeze(uint64_t a);                                // makes the 2 MiB re
 int mem_frozen(uint64_t a);                                // the 2 MiB region of a is frozen: no page in it changed
                                                            // since its freeze; nonzero is that freeze's number
 void mem_thaw(uint64_t a, uint64_t n);                     // makes the frozen regions over [a, a+n) writable again;
+void mem_thaw_wb(uint64_t a, uint64_t n);   // a GPU write-back's thaw: no lock when nothing needs one (MKW_THAW_FAST)
+void mem_thaw_wb_stats(uint64_t *skipped, uint64_t *locked);   // since the last call (perf.c)
                                                            // before a kernel write (file read) into guest memory;
                                                            // commits the range first (mem_commit_range)
 void mem_commit_range(uint64_t a, uint64_t n);             // Windows' lazy commit (MKW_LAZY_COMMIT): the game's

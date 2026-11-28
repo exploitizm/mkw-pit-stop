@@ -480,6 +480,7 @@ static const CfgRow rows[] = {
     K("TEX_UP_LOG"),
     K("TEX_UP_LOG_AT"),
     K("TEX_ZERO_LOG"),
+    K("THAW_FAST"),
     K("TRACE_UBO"),
     K("TRACE_UBO_OUT"),
     K("UBO_SNAPSHOT"),

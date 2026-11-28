@@ -212,7 +212,7 @@ void vk_gpu_written(uint64_t addr, uint64_t size) {
                 if (watch_hi) watch_event("write-back merged", addr, addr + size, 0, wb);
             } else if ((copied = !read_traps || !mem_trap(addr, size, r->smap + (addr - r->import_lo)))) {
                 hang_mark("write-back: thaw and copy");
-                mem_thaw(addr, size);
+                mem_thaw_wb(addr, size);
                 memcpy((void *)(uintptr_t)addr, r->smap + (addr - r->import_lo), size);
                 wb = size;
                 if (watch_hi) watch_event("write-back copied", addr, addr + size, 0, wb);

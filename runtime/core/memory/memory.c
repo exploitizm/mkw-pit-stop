@@ -159,6 +159,41 @@ void mem_thaw(uint64_t a, uint64_t n) {
     }
 }
 
+// MKW_THAW_FAST (default 0 until measured, "ab"): the GPU write-backs' thaws (vk_mem_merge.c, vk_mem_wback.c) skip
+// frz_lock when nothing over the range needs one: no 2 MiB region frozen, no page trapped (read, early-read, base or
+// spill trap), no lazy commit (Windows). Both maps are read without the lock as mem_trapped does. A freeze or a trap
+// made after the look meets the write-back's store as any guest write: it faults, and the fault thaws. Stall trace of
+// 28/11/2026 (thaw1/ms-ab, 1.8.0 GP): the completion thread's merge waited 43-56 ms in one mem_thaw of a 0.2 KiB range
+// for frz_lock, held by a guest thread's Map/UnmapPhysicalMemory of a 5-21 MiB pool, and the fence's waiters (the
+// game's main thread) with it: the race's 50-94 ms frames.
+static int lazy;   // (defined with the lazy commit below)
+static int thaw_idle(uint64_t a, uint64_t n) {
+    if (lazy || !n || a >= RT_ADDRESS_LIMIT || n > RT_ADDRESS_LIMIT - a) return 0;
+    for (uint64_t r = a >> FRZ_SHIFT; r <= (a + n - 1) >> FRZ_SHIFT; r++)
+        if (__atomic_load_n(&frz[r], __ATOMIC_ACQUIRE)) return 0;
+    uint8_t *t = __atomic_load_n(&trapped, __ATOMIC_ACQUIRE);
+    if (t)
+        for (uint64_t p = a / PAGE; p <= (a + n - 1) / PAGE; p++)
+            if (__atomic_load_n(&t[p], __ATOMIC_RELAXED)) return 0;
+    return 1;
+}
+
+static uint64_t thaw_fast_skips, thaw_fast_locked;
+void mem_thaw_wb(uint64_t a, uint64_t n) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("THAW_FAST", "0");
+    if (RT_KNOB_ON(mode) && thaw_idle(a, n)) {
+        __atomic_add_fetch(&thaw_fast_skips, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    if (RT_KNOB_ON(mode)) __atomic_add_fetch(&thaw_fast_locked, 1, __ATOMIC_RELAXED);
+    mem_thaw(a, n);
+}
+void mem_thaw_wb_stats(uint64_t *skipped, uint64_t *locked) {
+    *skipped = __atomic_exchange_n(&thaw_fast_skips, 0, __ATOMIC_RELAXED);
+    *locked = __atomic_exchange_n(&thaw_fast_locked, 0, __ATOMIC_RELAXED);
+}
+
 static void thaw_for_kernel(uint64_t a, size_t n) { if (watched(a, n)) mem_thaw(a, n); }   // plat_mem_thaw_hook
 
 // frz_lock held exclusively. Makes the committed pages of region r read-only when every one of them is read-write;

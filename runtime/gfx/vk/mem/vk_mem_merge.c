@@ -123,7 +123,7 @@ typedef struct { uint64_t lo, hi, gpu, copied; } MergeStat;
 static _Thread_local uint64_t mt_n, mt_ns;
 static void thaw_timed(uint64_t a, uint64_t n) {
     uint64_t t0 = qpc();
-    mem_thaw(a, n);
+    mem_thaw_wb(a, n);
     mt_n++, mt_ns += qpc() - t0;
 }
 

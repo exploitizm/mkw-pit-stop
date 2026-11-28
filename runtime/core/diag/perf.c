@@ -160,7 +160,10 @@ static void ledger_take(char *out, size_t cap, uint64_t rep_ns) {
 static void ledger_window(uint64_t frame, uint64_t n) {
     char b[768];
     ledger_fmt(b, sizeof b, lg_win, (double)n);
-    rt_log("perf: frame %llu: costs ms/f:%s", (unsigned long long)frame, b);
+    uint64_t tf_s = 0, tf_l = 0;
+    mem_thaw_wb_stats(&tf_s, &tf_l);
+    rt_log("perf: frame %llu: costs ms/f:%s; write-back thaws skipped %llu, locked %llu (MKW_THAW_FAST)",
+           (unsigned long long)frame, b, (unsigned long long)tf_s, (unsigned long long)tf_l);
     memset(lg_win, 0, sizeof lg_win);
 }
 
