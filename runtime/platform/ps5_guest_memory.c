@@ -425,12 +425,32 @@ static bool native_rw(const Ps5MixedBlock *unit, uint64_t off) {
     return false;
 }
 
+// MKW_UNPACK_BATCH (perf.c, "ab"): a unit's backing makes its page protections in one batch (ps5_mem_batch_*), one
+// sceKernelMprotect per run of equal mode, not one per 16 KiB page in ps5_mixed_back_fill and again per armed page
+// below: up to 8 calls of 70-100 us per unpacked unit, outside every counter. Backing split of 28/11/2026 (backsplit):
+// in the frames over 40 ms the unpacks took 19.5 ms against 10.4 for their commits' steps (allocation, maps, fill),
+// in the 94 ms frame 84 against 28.
+static volatile int back_batch_on;
+static uint64_t back_total_ns;   // every backing's whole time (plat_mem_cost_ns)
+int plat_mem_unpack_batch_mode(int on) {
+    __atomic_store_n(&back_batch_on, on ? 1 : 0, __ATOMIC_RELEASE);
+    return 0;
+}
+
 static bool back_unit_locked(Ps5MixedBlock *unit, RangeKind kind, int in_signal, int cause) {
     if (unit->backing.committed) return true;
     PackBlob *pk = unit->pack;
-    uint64_t t0 = pk ? plat_now_ns() : 0;
+    uint64_t bt0 = plat_now_ns();
+    uint64_t t0 = pk ? bt0 : 0;
     Ps5MemCommitReport rep = {0};
+    Ps5ProtBatch ub, *outer = NULL;
+    int batched = __atomic_load_n(&back_batch_on, __ATOMIC_ACQUIRE);
+    if (batched) outer = ps5_mem_batch_swap(NULL), ps5_mem_batch_begin(&ub);
     int rc = pk ? ps5_mixed_back_fill(unit, &rep, unpack_fill, pk) : ps5_mixed_back_report(unit, &rep);
+    if (rc && batched) ps5_mem_batch_end(), ps5_mem_batch_swap(outer);
+    // The guest modes' protections land before the early-read pages' own calls below, as without the batch: flushed
+    // after them, a page's mode would undo its early-read protection. The armed pages' then go in the batch again.
+    if (!rc && batched && ps5_mem_batch_flush()) prot_watch_mark_written(unit->backing.address, PS5_MEM_UNIT);
     if (rc) {
         if (pk && !rep.allocation_status && !rep.private_status && !rep.private_unmap_status && !rep.mapping_status)
             fprintf(stderr, "PS5 memory unpack %#llx failed: its packed bytes do not decompress (%u bytes)\n",
@@ -472,6 +492,11 @@ static bool back_unit_locked(Ps5MixedBlock *unit, RangeKind kind, int in_signal,
                 prot_watch_mark_written(p, PS5_MEM_PAGE);
         }
     }
+    if (batched) {   // the unit's protections now; a failed one: the whole unit counts as written
+        if (ps5_mem_batch_end()) prot_watch_mark_written(unit->backing.address, PS5_MEM_UNIT);
+        ps5_mem_batch_swap(outer);
+    }
+    __atomic_add_fetch(&back_total_ns, plat_now_ns() - bt0, __ATOMIC_RELAXED);
     prot_watch_touch(unit->backing.address, PS5_MEM_UNIT);   // the pages not armed: written
     size_t total = __atomic_load_n(&backed_units[RANGE_HEAP], __ATOMIC_RELAXED) +
                    __atomic_load_n(&backed_units[RANGE_ALIAS], __ATOMIC_RELAXED) +
@@ -538,6 +563,12 @@ static void pstat_add(uintptr_t ra, uint64_t ns, int kind) {
 void plat_mem_cost_ns(uint64_t out[PLAT_MEM_COST_N]) {
     for (int i = 0; i < PLAT_MEM_COST_N; i++) out[i] = __atomic_load_n(&pstat_kind_ns[i], __ATOMIC_RELAXED);
     out[PLAT_MEM_COST_UNPACK] = __atomic_load_n(&pk_unpack_total_ns, __ATOMIC_RELAXED);
+    uint64_t ct[PS5_COMMIT_N];
+    ps5_mem_commit_times(ct);
+    out[PLAT_MEM_COST_BACK_ALLOC] = ct[PS5_COMMIT_ALLOC], out[PLAT_MEM_COST_BACK_PRIVMAP] = ct[PS5_COMMIT_PRIVMAP];
+    out[PLAT_MEM_COST_BACK_FILL] = ct[PS5_COMMIT_FILL], out[PLAT_MEM_COST_BACK_FIXED] = ct[PS5_COMMIT_FIXED];
+    out[PLAT_MEM_COST_BACK_FRESH] = ct[PS5_COMMIT_FRESH_NS], out[PLAT_MEM_COST_BACK_FRESH_N] = ct[PS5_COMMIT_FRESH_N];
+    out[PLAT_MEM_COST_BACK_TOTAL] = __atomic_load_n(&back_total_ns, __ATOMIC_RELAXED);
 }
 
 void plat_mem_protect_stats(void (*emit)(uintptr_t ra, uint64_t n, uint64_t ns, void *ctx), void *ctx) {

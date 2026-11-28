@@ -131,12 +131,15 @@ enum { LG_REPLAY = PERF_LG_N, LG_PLAT, LG_ALL = LG_PLAT + PLAT_MEM_COST_N };
 static uint64_t lg_win[LG_ALL];
 
 static void ledger_fmt(char *out, size_t cap, const uint64_t *ns, double div) {
-    static const char *const extra[LG_ALL - PERF_LG_N] = {"replay",      "prot_fault", "prot_arm", "prot_hold",
-                                                          "prot_change", "prot_early", "unpack",   "prot_calls"};
+    static const char *const extra[LG_ALL - PERF_LG_N] = {
+        "replay",     "prot_fault",  "prot_arm",  "prot_hold",  "prot_change", "prot_early", "unpack",
+        "prot_calls", "back_alloc",  "back_map",  "back_fill",  "back_fixed",  "back_fresh", "back_fresh_n",
+        "back_total"};
     size_t o = 0;
     out[0] = 0;
     for (int i = 0; i < LG_ALL && o < cap; i++) {
-        int count = i == LG_PLAT + PLAT_MEM_COST_PROT_CALLS || i == PERF_LG_DRAWS;   // a count, not ns
+        int count = i == LG_PLAT + PLAT_MEM_COST_PROT_CALLS || i == LG_PLAT + PLAT_MEM_COST_BACK_FRESH_N ||
+                    i == PERF_LG_DRAWS;   // a count, not ns
         double ms = (double)ns[i] / (count ? 1.0 : 1e6) / div;
         if (ms >= 0.05) o += (size_t)snprintf(out + o, cap - o, " %s %.2f", i < PERF_LG_N ? ledger_name[i] : extra[i - PERF_LG_N], ms);
     }
@@ -155,7 +158,7 @@ static void ledger_take(char *out, size_t cap, uint64_t rep_ns) {
 }
 
 static void ledger_window(uint64_t frame, uint64_t n) {
-    char b[384];
+    char b[768];
     ledger_fmt(b, sizeof b, lg_win, (double)n);
     rt_log("perf: frame %llu: costs ms/f:%s", (unsigned long long)frame, b);
     memset(lg_win, 0, sizeof lg_win);
@@ -513,6 +516,20 @@ static void pw_fault_batch_placement(void) {
     applied = on;
 }
 
+// MKW_UNPACK_BATCH (default 0, 1 in the PS5 profile: cfg.c has the A/B; "ab"): a unit's backing makes its page protections in one batch (ps5_guest_memory.c).
+static void unpack_batch_placement(void) {
+    static int mode = -1, applied = -1;
+    if (mode < 0) {
+        mode = rt_knob("UNPACK_BATCH", "0");
+        if (mode && plat_mem_unpack_batch_mode(0) < 0) mode = 0, applied = 0;
+        else if (mode) rt_log("mem: unit backings protect in one batch %s (MKW_UNPACK_BATCH)", mode == 2 ? "in the B blocks" : "on");
+    }
+    int on = RT_KNOB_ON(mode);
+    if (on == applied) return;
+    plat_mem_unpack_batch_mode(on);
+    applied = on;
+}
+
 void perf_present(uint64_t frame) {
     static uint64_t last, sum, max, n, win_start, ab_b;
     static int64_t win_prev[PERF_CNT_N];
@@ -557,6 +574,7 @@ void perf_present(uint64_t frame) {
     pw_batch_placement();
     pw_hot_placement();
     pw_fault_batch_placement();
+    unpack_batch_placement();
     if (__atomic_load_n(&overlay, __ATOMIC_RELAXED))   // the overlay's only cost while it is off: this branch
         perfmon_frame(now, d, frame_ns, rep, __atomic_load_n(&counts[PERF_CNT_TEX_UP], __ATOMIC_RELAXED));
     kern_core_diag_frame(frame, d);
@@ -571,7 +589,7 @@ void perf_present(uint64_t frame) {
         const char *e = cfg_get("MKW_PERF_SLOW_MS");
         slow_ns = (uint64_t)(e && atoi(e) > 0 ? atoi(e) : 50) * 1000000ull;
     }
-    char costs[384], storm[512];
+    char costs[768], storm[512];
     ledger_take(costs, sizeof costs, rep);   // every present, so a slow frame's ledger is its own period's
     if (plat_mem_storm_take(storm, sizeof storm, 64))   // 64+ write faults: ~3x a normal frame's (protsplit, 28/11)
         rt_log("perf: fault storm frame %llu: %s", (unsigned long long)frame, storm);

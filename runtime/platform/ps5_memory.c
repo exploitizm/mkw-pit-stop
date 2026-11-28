@@ -2,6 +2,7 @@
 // its protection page, and both are larger than a guest page.
 #include "ps5_memory.h"
 #include "prot_watch.h"
+#include "platform.h"
 
 #include <ps5platform/kernel.h>
 #include <stdlib.h>
@@ -67,15 +68,28 @@ static int probe_any_mapping(Ps5MemBlock *block, Ps5MemCommitReport *report) {
 // it mapped at its guest address. Zeroing after the fixed map let another thread write the unit in between (it no
 // longer faults, so it never waits for the unit's lock) and lost that write: the title's MetaDataBase::setData crash
 // (19/11/2026), a SharedBuffer header the game had just written read back as 0. Two more calls per unit backed.
+// Step times (ps5_mem_commit_times): bench of 28/11/2026, an 83.6 ms frame carried 83.8 ms of unpacks, and the fault
+// storms of streamed zstd output were all fresh units committed, with no duration accounted for them at all.
+static uint64_t commit_ns[PS5_COMMIT_N];
+#define COMMIT_ADD(k, v) __atomic_add_fetch(&commit_ns[k], (v), __ATOMIC_RELAXED)
+void ps5_mem_commit_times(uint64_t out[PS5_COMMIT_N]) {
+    for (int i = 0; i < PS5_COMMIT_N; i++) out[i] = __atomic_load_n(&commit_ns[i], __ATOMIC_RELAXED);
+}
+
 static int fill_private(Ps5MemBlock *block, Ps5MemCommitReport *report, int (*fill)(void *ctx, void *unit), void *ctx) {
     void *at = NULL;
+    uint64_t t0 = plat_now_ns();
     int result = sceKernelMapDirectMemory(&at, PS5_MEM_UNIT, cpu_rw, 0, block->physical, PS5_MEM_UNIT);
+    uint64_t t1 = plat_now_ns();
     if (report) report->private_status = result;
     if (result) return result;
     if (!at) return PS5_MEM_RELOCATED;
     if (fill) result = fill(ctx, at);
     else memset(at, 0, PS5_MEM_UNIT);   // the direct-memory allocator can return a previously used unit
+    uint64_t t2 = plat_now_ns();
     int unmapped = sceKernelMunmap(at, PS5_MEM_UNIT);
+    COMMIT_ADD(PS5_COMMIT_PRIVMAP, (t1 - t0) + (plat_now_ns() - t2));
+    COMMIT_ADD(PS5_COMMIT_FILL, t2 - t1);
     if (report) report->private_unmap_status = unmapped;
     if (unmapped) block->relocated = at;   // still mapped: ps5_mem_release unmaps it, the physical unit is kept
     return result ? result : unmapped;
@@ -85,8 +99,10 @@ static int commit(Ps5MemBlock *block, Ps5MemCommitReport *report, bool probe_any
                   void *ctx) {
     if (report) *report = (Ps5MemCommitReport){0};
     if (!block->reserved || block->committed || block->allocated || block->relocated) return PS5_MEM_BAD_REQUEST;
+    uint64_t c0 = plat_now_ns();
     int result = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), PS5_MEM_UNIT,
                                                PS5_MEM_UNIT, PS5_KERNEL_DIRECT_TYPE_CPU, &block->physical);
+    COMMIT_ADD(PS5_COMMIT_ALLOC, plat_now_ns() - c0);
     if (report) *report = (Ps5MemCommitReport){.attempted = true, .allocation_status = result};
     if (result) return result;
     block->allocated = true;
@@ -105,8 +121,11 @@ static int commit(Ps5MemBlock *block, Ps5MemCommitReport *report, bool probe_any
     // MAP_FIXED replaces the single reservation this block already owns. Use
     // the direct-unit alignment seen in Hookshot a3551c6's guest mappings.
     void *mapped = (void *)block->address;
+    uint64_t f0 = plat_now_ns();
     result = sceKernelMapDirectMemory(&mapped, PS5_MEM_UNIT, cpu_rw, PS5_KERNEL_MAP_FIXED,
                                       block->physical, PS5_MEM_UNIT);
+    uint64_t f1 = plat_now_ns();
+    COMMIT_ADD(PS5_COMMIT_FIXED, f1 - f0);
     if (report) {
         report->fixed_attempted = true;
         report->fixed_address = mapped;
@@ -118,6 +137,7 @@ static int commit(Ps5MemBlock *block, Ps5MemCommitReport *report, bool probe_any
         return cleanup ? cleanup : result;
     }
     block->committed = true;
+    if (!fill) COMMIT_ADD(PS5_COMMIT_FRESH_NS, f1 - c0), COMMIT_ADD(PS5_COMMIT_FRESH_N, 1);
     return 0;
 }
 

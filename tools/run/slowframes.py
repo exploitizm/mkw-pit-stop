@@ -39,6 +39,9 @@ CHILDREN = {
     "replay_walk": ["precheck"],
     "precheck": ["upload", "texlock"],
     "upload": ["astc"],
+    # a unit's commit by step (ps5_memory.c): fresh units and unpacks share the steps
+    "unpack": ["back_total", "back_fill", "back_map", "back_alloc", "back_fixed"],
+    "back_fresh": ["back_alloc", "back_map", "back_fill", "back_fixed"],
 }
 BLOCKED = ("pipeline", "texture", "astc", "fence")  # render thread's own waits on the slow-frame line (pacing is idle)
 GPU_TAIL_MS = -2.0  # FRAME_TRACE ts above this: the frame ended within 2 ms of the GPU finishing its last work

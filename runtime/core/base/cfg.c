@@ -482,6 +482,7 @@ static const CfgRow rows[] = {
     K("TRACE_UBO"),
     K("TRACE_UBO_OUT"),
     K("UBO_SNAPSHOT"),
+    K("UNPACK_BATCH"),
     K("UPDATE_AS"),
     K("UPDATE_REPO"),
     K("USNAP_ASYNC"),
@@ -739,6 +740,11 @@ static const struct { const char *key, *value; } PS5[] = {
     // 1 % low 39.5 -> 41.3 and 38.3 -> 42.0 fps, frames over 20 ms 4.1 -> 2.7 % and 3.5 -> 3.2 %, frame unchanged; a
     // race watched by the user with it on showed no stale texture.
     {"PRECHECK_PAR", "1"},
+    // A unit's backing (an unpack, a fresh commit) makes its page protections in one batch (ps5_guest_memory.c
+    // back_unit_locked): in-race A/B, two 1.8.0 Grand Prix (ub-ab0 / ub-ab1, 28/11/2026), the slow frames' backing time
+    // outside the commits' own steps 254 -> 71 and 435 -> 52 ms, 1 % low 42.0 -> 43.5 and 40.7 -> 44.2 fps, frames
+    // over 33.3 ms 12 -> 14 and 20 -> 6, frame unchanged.
+    {"UNPACK_BATCH", "1"},
     // The console's own controller: PlayStation icons rather than auto, which guesses from the pad's labels (Xbox when
     // it reports none), and the DualSense's vibration at 100 % (the table's 130 % suits PC pads; asked for by the user,
     // 24/11/2026). Both stay in Pit Stop > Controls.

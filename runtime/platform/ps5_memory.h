@@ -43,6 +43,12 @@ int ps5_mem_commit_fill(Ps5MemBlock *block, Ps5MemCommitReport *report, int (*fi
 // First try an OS-chosen map of the same unit and discard it before mapping at
 // the owned reservation. A failed OS-chosen map does not suppress the fixed test.
 int ps5_mem_commit_probe(Ps5MemBlock *block, Ps5MemCommitReport *report);
+// Running totals in ns of the commits' steps, every thread (never reset): direct-memory allocation, the private map and
+// its unmap, the fill (zeros for a fresh unit, the bytes of a packed one), the fixed map at the guest address; then the
+// same commits' whole time and count for fresh units (no fill function) apart. plat_mem_cost_ns reads them.
+enum { PS5_COMMIT_ALLOC, PS5_COMMIT_PRIVMAP, PS5_COMMIT_FILL, PS5_COMMIT_FIXED, PS5_COMMIT_FRESH_NS, PS5_COMMIT_FRESH_N,
+       PS5_COMMIT_N };
+void ps5_mem_commit_times(uint64_t out[PS5_COMMIT_N]);
 typedef enum { PS5_MEM_NONE, PS5_MEM_READ, PS5_MEM_RW } Ps5MemProt;
 int ps5_mem_protect_native(Ps5MemBlock *block, size_t offset, size_t bytes, Ps5MemProt protection);
 // A protect batch (one per thread): while one is open, ps5_mem_protect_native records each native page's final mode and
