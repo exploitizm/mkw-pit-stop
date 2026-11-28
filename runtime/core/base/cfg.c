@@ -270,6 +270,7 @@ static const CfgRow rows[] = {
     K("CRIT"),
     K("CRIT_OUT"),
     K("CTL"),
+    K("DECOMMIT_RUN"),
     K("DISCORD_APP"),
     K("DLSSG_DISABLE_BUF"),
     K("DLSSG_EXP"),
@@ -347,6 +348,7 @@ static const CfgRow rows[] = {
     K("LIST_WATCH"),
     K("LOCALE"),
     K("LOGIC_HZ_TT"),
+    K("MAP_PROBE"),
     K("MEMCPY_HOLD"),
     K("MENU_TEST"),
     K("MENU_TEST_DIR"),
@@ -507,6 +509,7 @@ static const CfgRow rows[] = {
     K("WB_PAR"),
     K("YIELD_NOLOCK"),
     K("YIELD_PAUSE"),
+    K("ZERO_POOL"),
     K("ZERO_SCAN_CACHE"),
 };
 #define N_ROWS (sizeof rows / sizeof *rows)

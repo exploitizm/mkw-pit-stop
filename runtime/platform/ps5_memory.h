@@ -68,7 +68,20 @@ int ps5_mem_batch_end(void);     // flushes and closes the thread's batch
 Ps5ProtBatch *ps5_mem_batch_swap(Ps5ProtBatch *batch);   // the fault handler: protections it makes take effect now
 int ps5_mem_protect(Ps5MemBlock *block, size_t offset, size_t bytes, bool writable);
 int ps5_mem_decommit(Ps5MemBlock *block);
+// The same for n committed units in a row (blocks[i] at blocks[0]'s address + i units): one unmap and, where it lands in
+// place, one reservation for the whole run. MKW_MAP_PROBE, 28/11/2026 on the console: 32 unmaps of 64 KiB took 1,353 us
+// against 14.5 for one of 2 MiB (maps cost ~2 us either way). The caller holds every unit's lock.
+int ps5_mem_decommit_run(Ps5MemBlock *const *blocks, int n);
 int ps5_mem_release(Ps5MemBlock *block);
+// MKW_ZERO_POOL: released units are kept and zeroed on a thread of their own ("zeropool"), and fresh commits take one
+// instead of allocating and zeroing their own (ps5_memory.c). on 0 gives the kept units back. -1: no thread.
+int ps5_mem_zero_pool(int on);
+uint64_t ps5_mem_zero_pool_bytes(void);   // held by the pool now (free for the guest's commits)
+// since the last call: taken zeroed, taken not yet zeroed, missed (pool empty), recycled, zeroed by the thread; then
+// the units zeroed and waiting now
+void ps5_mem_zero_pool_stats(uint64_t out[7]);
+// MKW_MAP_PROBE: one 2 MiB fixed map against 32 of 64 KiB, their unmaps, a part released on its own; the line into out
+void ps5_mem_map_probe(char *out, size_t cap);
 // Direct memory for the runtime's own use (MKW_PACK's store) at an OS-chosen address aligned to align: bytes and align
 // multiples of PS5_MEM_UNIT. NULL when the memory or the map fails (nothing kept). The host model (not __PROSPERO__)
 // takes it from the C heap, so its tests' direct-memory counts stay those of the guest.

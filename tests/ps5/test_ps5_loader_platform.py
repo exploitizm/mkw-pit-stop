@@ -65,6 +65,8 @@ def test_ps5_loader_platform(tmp_path: Path) -> None:
             "-Wl,--gc-sections",
             "-pthread",
             "-DMKW_PS5_LOADER_ONLY",
+            "-DZP_TRIM_AVAIL=0",   # MKW_ZERO_POOL: the model's 1 MiB of direct memory neither trims the pool
+            "-DZP_TOP_AVAIL=UINT64_MAX",   # nor has units allocated ahead (ps5_memory.c)
             f"-I{platform}",
             *(f"-I{ROOT / 'runtime' / d}" for d in ("", "core/memory", "core/base", "core/kernel", "core/diag", "cpu")),
             f"-I{tmp_path}",

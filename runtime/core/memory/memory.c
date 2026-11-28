@@ -183,6 +183,12 @@ void mem_thaw_wb(uint64_t a, uint64_t n) {
     static int mode = -1;
     if (mode < 0) mode = rt_knob("THAW_FAST", "0");
     if (RT_KNOB_ON(mode) && thaw_idle(a, n)) {
+        // Still the thaw request's hold (thaw_locked why 2): without it the regions the GPU writes back into froze
+        // again at once, and the guest's next writes faulted to thaw them and MKW_PACK packed them sooner; every
+        // THAW_FAST run of 28/11/2026 scored a 1 % low of 38.2-39.8 fps against 42.1-43.3 without (zp1_*, zs_*,
+        // zt_*). A freeze that reads the old time meets the write-back's store as any guest write: it faults.
+        uint32_t now = (uint32_t)plat_now_ms() | 1;
+        for (uint64_t r = a >> FRZ_SHIFT; r <= (a + n - 1) >> FRZ_SHIFT; r++) __atomic_store_n(&thaw_ms[r], now, __ATOMIC_RELAXED);
         __atomic_add_fetch(&thaw_fast_skips, 1, __ATOMIC_RELAXED);
         return;
     }

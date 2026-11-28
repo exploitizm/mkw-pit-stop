@@ -325,6 +325,11 @@ void plat_mem_cost_ns(uint64_t out[PLAT_MEM_COST_N]);
 // out and 1; the tables are cleared either way (ps5_guest_memory.c storm_note).
 int plat_mem_storm_take(char *out, size_t cap, uint32_t min_faults);
 int plat_mem_unpack_batch_mode(int on);   // MKW_UNPACK_BATCH (PS5; -1 elsewhere)
+int plat_mem_zero_pool_mode(int on);      // MKW_ZERO_POOL (PS5; -1 elsewhere)
+int plat_mem_decommit_run_mode(int on);   // MKW_DECOMMIT_RUN (PS5; -1 elsewhere)
+int plat_mem_map_probe(char *out, size_t cap);          // MKW_MAP_PROBE (PS5; nothing elsewhere)
+// since the last call: taken zeroed, taken not yet zeroed, missed, recycled, zeroed; units ready now (0s elsewhere)
+void plat_mem_zero_pool_stats(uint64_t out[7]);
 void plat_mem_back_causes(uint64_t out[PLAT_BACK_N]);
 int plat_mem_watch_info(uint64_t addr);
 void plat_mem_gpu_import(uint64_t addr, size_t n, int on);

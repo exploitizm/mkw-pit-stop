@@ -222,7 +222,8 @@ uint64_t plat_mem_dmem_free_total(void) {
     if (dmem_total <= 0) return UINT64_MAX;
     int areas, cut;
     uint64_t total = dmem_free_scan(dmem_total, &areas, &cut);
-    return cut && !areas ? UINT64_MAX : total;   // (no area and cut: another thread's scan was running)
+    return cut && !areas ? UINT64_MAX : total + ps5_mem_zero_pool_bytes();   // (no area and cut: another thread's
+                                                                              // scan was running; the pool: dmem_avail)
 }
 
 // MKW_BENCH's memory report (core/diag/bench_mem.c), once a second on its own thread: free direct memory (all areas,
@@ -249,8 +250,10 @@ void plat_mem_pressure(PlatMemPressure *p) {
 uint64_t plat_mem_dmem_avail(void) {
     int64_t phys = 0;
     size_t avail = 0;
+    // MKW_ZERO_POOL's units count as free: the guest's next commits take them first, and the pool gives them back
+    // when direct memory runs low, so the governor packs and trims no more than without it.
     if (sceKernelAvailableDirectMemorySize(0, INT64_MAX, PS5_MEM_UNIT, &phys, &avail) == 0)
-        return (uint64_t)avail;
+        return (uint64_t)avail + ps5_mem_zero_pool_bytes();
     return UINT64_MAX;
 }
 
@@ -432,6 +435,12 @@ static bool native_rw(const Ps5MixedBlock *unit, uint64_t off) {
 // in the 94 ms frame 84 against 28.
 static volatile int back_batch_on;
 static uint64_t back_total_ns;   // every backing's whole time (plat_mem_cost_ns)
+int plat_mem_zero_pool_mode(int on) { return ps5_mem_zero_pool(on); }
+int plat_mem_map_probe(char *out, size_t cap) {
+    ps5_mem_map_probe(out, cap);
+    return 1;
+}
+void plat_mem_zero_pool_stats(uint64_t out[7]) { ps5_mem_zero_pool_stats(out); }
 int plat_mem_unpack_batch_mode(int on) {
     __atomic_store_n(&back_batch_on, on ? 1 : 0, __ATOMIC_RELEASE);
     return 0;
@@ -962,6 +971,60 @@ static Ps5MixedBlock *find_unit(VmRange *range, uint64_t address, bool create) {
     return &chunk[uidx];
 }
 
+// MKW_DECOMMIT_RUN (perf.c, "ab"): a decommit releases whole units with backing up to 32 in a row with one unmap
+// (ps5_mem_decommit_run) instead of one unmap per unit after a protection change per native page. Each unmap costs
+// ~42 us on the console where one of 2 MiB costs 14.5 (MKW_MAP_PROBE, 28/11/2026): the deferred release of the game's
+// 21 MiB pools held frz_lock ~47 ms, and the write-back thaws and the game's next MapPhysicalMemory waited behind it
+// (the race's 60-95 ms frames). 0 none, -1 the decommit failed.
+static volatile int dc_run_on;
+int plat_mem_decommit_run_mode(int on) {
+    __atomic_store_n(&dc_run_on, on ? 1 : 0, __ATOMIC_RELEASE);
+    return 0;
+}
+static int64_t decommit_units(VmRange *range, uint64_t at, uint64_t end) {
+    enum { RUN = 32 };
+    if (!__atomic_load_n(&dc_run_on, __ATOMIC_ACQUIRE)) return 0;
+    Ps5MixedBlock *u[RUN];
+    Ps5MemBlock *b[RUN];
+    int n = 0;
+    for (uint64_t a = at; n < RUN && a + PS5_MEM_UNIT <= end; a += PS5_MEM_UNIT) {
+        Ps5MixedBlock *x = find_unit(range, a, false);
+        if (!x) break;
+        unit_lock(x);
+        if (!x->backing.committed || x->backing.relocated || x->backing.address != a) {
+            unit_unlock(x);
+            break;
+        }
+        u[n] = x, b[n] = &x->backing, n++;
+    }
+    if (!n) return 0;
+    int result = ps5_mem_decommit_run(b, n);
+    if (result == PS5_MEM_BAD_REQUEST || (result && b[0]->committed)) {   // nothing changed: page by page instead
+        for (int i = 0; i < n; i++) unit_unlock(u[i]);
+        return 0;
+    }
+    for (int i = 0; i < n; i++) {
+        Ps5MixedBlock *x = u[i];
+        memset(x->pages, PS5_GUEST_RESERVED, sizeof x->pages);
+        x->live_pages = 0;
+        prot_watch_mark_written(x->backing.address, PS5_MEM_UNIT);   // as the page path marks each native page
+        __atomic_sub_fetch(&backed_units[range->kind], 1, __ATOMIC_RELAXED);
+        if (x->pack) {   // a unit with no page left has nothing to unpack
+            PackBlob *pb = x->pack;
+            x->pack = NULL;
+            __atomic_sub_fetch(&packed_units[range->kind], 1, __ATOMIC_RELAXED);
+            __atomic_sub_fetch(&pk_packed_bytes, pb->csize, __ATOMIC_RELAXED);
+            pk_drop(pb);
+        }
+        unit_unlock(x);
+    }
+    if (result) {
+        sdk_ok("decommit", at, (uint64_t)n * PS5_MEM_UNIT, result);
+        return -1;
+    }
+    return (int64_t)n * PS5_MEM_UNIT;
+}
+
 typedef enum { COMMIT, DECOMMIT, PROTECT } Change;
 static bool change(uint64_t address, uint64_t bytes, Change action, int protection) {
     if (!bytes || (address | bytes) % PAGE || bytes > UINT64_MAX - address) return false;
@@ -1020,6 +1083,14 @@ static bool change(uint64_t address, uint64_t bytes, Change action, int protecti
     } while (0)
     bool ok_all = true;
     for (uint64_t at = address; at < end; at += PAGE) {
+        if (action == DECOMMIT && !(at % PS5_MEM_UNIT)) {
+            int64_t done = decommit_units(range, at, end);
+            if (done < 0) return false;
+            if (done) {
+                at += (uint64_t)done - PAGE;
+                continue;
+            }
+        }
         Ps5MixedBlock *unit = find_unit(range, at, action == COMMIT);
         if (!unit) {
             if (action == DECOMMIT) continue;

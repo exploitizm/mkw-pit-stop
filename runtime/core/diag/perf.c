@@ -160,12 +160,16 @@ static void ledger_take(char *out, size_t cap, uint64_t rep_ns) {
 static void ledger_window(uint64_t frame, uint64_t n) {
     char b[768];
     ledger_fmt(b, sizeof b, lg_win, (double)n);
-    uint64_t tf_s = 0, tf_l = 0, ud = 0, ur = 0;
+    uint64_t tf_s = 0, tf_l = 0, ud = 0, ur = 0, zp[7];
     mem_thaw_wb_stats(&tf_s, &tf_l);
     mem_unmap_defer_stats(&ud, &ur);
+    plat_mem_zero_pool_stats(zp);
     rt_log("perf: frame %llu: costs ms/f:%s; write-back thaws skipped %llu, locked %llu (MKW_THAW_FAST); unmaps deferred "
-           "%llu, drained by a map %llu (MKW_UNMAP_DEFER)", (unsigned long long)frame, b, (unsigned long long)tf_s,
-           (unsigned long long)tf_l, (unsigned long long)ud, (unsigned long long)ur);
+           "%llu, drained by a map %llu (MKW_UNMAP_DEFER); zero pool: taken %llu zeroed + %llu not, missed %llu, "
+           "recycled %llu, zeroed %llu, ready %llu + %llu (MKW_ZERO_POOL)", (unsigned long long)frame, b,
+           (unsigned long long)tf_s, (unsigned long long)tf_l, (unsigned long long)ud, (unsigned long long)ur,
+           (unsigned long long)zp[0], (unsigned long long)zp[1], (unsigned long long)zp[2], (unsigned long long)zp[3],
+           (unsigned long long)zp[4], (unsigned long long)zp[5], (unsigned long long)zp[6]);
     memset(lg_win, 0, sizeof lg_win);
 }
 
@@ -535,6 +539,43 @@ static void unpack_batch_placement(void) {
     applied = on;
 }
 
+// MKW_ZERO_POOL (default 0 until measured, "ab"): released direct-memory units are kept and zeroed on a thread of
+// their own, and fresh unit commits take one (ps5_memory.c): the race's 600-700-unit frames of pool churn.
+static void zero_pool_placement(void) {
+    static int mode = -1, applied = -1;
+    if (mode < 0) {
+        mode = rt_knob("ZERO_POOL", "0");
+        if (mode && plat_mem_zero_pool_mode(0) < 0) mode = 0, applied = 0;
+        else if (mode) rt_log("mem: zeroed unit pool %s (MKW_ZERO_POOL)", mode == 2 ? "in the B blocks" : "on");
+    }
+    static int probed;
+    if (!probed) {
+        probed = 1;
+        char line[512] = "";
+        if (rt_knob("MAP_PROBE", "0") > 0 && plat_mem_map_probe(line, sizeof line)) rt_log("mem: map probe: %s", line);
+    }
+    int on = RT_KNOB_ON(mode);
+    if (on == applied) return;
+    plat_mem_zero_pool_mode(on);
+    applied = on;
+}
+
+// MKW_DECOMMIT_RUN (default 0 until measured, "ab"): decommits release whole units up to 32 in a row with one unmap
+// (ps5_guest_memory.c decommit_units): the unmap thread's 47 ms frz_lock holds over the game's 21 MiB pools.
+static void decommit_run_placement(void) {
+    static int mode = -1, applied = -1;
+    if (mode < 0) {
+        mode = rt_knob("DECOMMIT_RUN", "0");
+        if (mode && plat_mem_decommit_run_mode(0) < 0) mode = 0, applied = 0;
+        else if (mode) rt_log("mem: decommits release unit runs in one unmap %s (MKW_DECOMMIT_RUN)",
+                              mode == 2 ? "in the B blocks" : "on");
+    }
+    int on = RT_KNOB_ON(mode);
+    if (on == applied) return;
+    plat_mem_decommit_run_mode(on);
+    applied = on;
+}
+
 void perf_present(uint64_t frame) {
     static uint64_t last, sum, max, n, win_start, ab_b;
     static int64_t win_prev[PERF_CNT_N];
@@ -580,6 +621,8 @@ void perf_present(uint64_t frame) {
     pw_hot_placement();
     pw_fault_batch_placement();
     unpack_batch_placement();
+    zero_pool_placement();
+    decommit_run_placement();
     if (__atomic_load_n(&overlay, __ATOMIC_RELAXED))   // the overlay's only cost while it is off: this branch
         perfmon_frame(now, d, frame_ns, rep, __atomic_load_n(&counts[PERF_CNT_TEX_UP], __ATOMIC_RELAXED));
     kern_core_diag_frame(frame, d);
