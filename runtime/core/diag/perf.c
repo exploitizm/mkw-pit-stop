@@ -560,8 +560,9 @@ static void zero_pool_placement(void) {
     applied = on;
 }
 
-// MKW_DECOMMIT_RUN (default 0 until measured, "ab"): decommits release whole units up to 32 in a row with one unmap
-// (ps5_guest_memory.c decommit_units): the unmap thread's 47 ms frz_lock holds over the game's 21 MiB pools.
+// MKW_DECOMMIT_RUN (default 0, 1 in the PS5 profile: cfg.c has the runs; "ab"): decommits release whole units up to
+// 32 in a row with one unmap (ps5_guest_memory.c decommit_units): the unmap thread's 47 ms frz_lock holds over the
+// game's 21 MiB pools.
 static void decommit_run_placement(void) {
     static int mode = -1, applied = -1;
     if (mode < 0) {
@@ -573,6 +574,22 @@ static void decommit_run_placement(void) {
     int on = RT_KNOB_ON(mode);
     if (on == applied) return;
     plat_mem_decommit_run_mode(on);
+    applied = on;
+}
+
+// MKW_FILL_WINDOW (default 0, 1 in the PS5 profile: cfg.c has the runs; "ab"): units' first contents (unpacks, fresh
+// zeros) written through one shared window unmapped once per 32 units instead of a private map each (ps5_memory.c).
+static void fill_window_placement(void) {
+    static int mode = -1, applied = -1;
+    if (mode < 0) {
+        mode = rt_knob("FILL_WINDOW", "0");
+        if (mode && plat_mem_fill_window_mode(0) < 0) mode = 0, applied = 0;
+        else if (mode)
+            rt_log("mem: unit fills through a shared window %s (MKW_FILL_WINDOW)", mode == 2 ? "in the B blocks" : "on");
+    }
+    int on = RT_KNOB_ON(mode);
+    if (on == applied) return;
+    plat_mem_fill_window_mode(on);
     applied = on;
 }
 
@@ -623,6 +640,7 @@ void perf_present(uint64_t frame) {
     unpack_batch_placement();
     zero_pool_placement();
     decommit_run_placement();
+    fill_window_placement();
     if (__atomic_load_n(&overlay, __ATOMIC_RELAXED))   // the overlay's only cost while it is off: this branch
         perfmon_frame(now, d, frame_ns, rep, __atomic_load_n(&counts[PERF_CNT_TEX_UP], __ATOMIC_RELAXED));
     kern_core_diag_frame(frame, d);

@@ -80,6 +80,9 @@ uint64_t ps5_mem_zero_pool_bytes(void);   // held by the pool now (free for the 
 // since the last call: taken zeroed, taken not yet zeroed, missed (pool empty), recycled, zeroed by the thread; then
 // the units zeroed and waiting now
 void ps5_mem_zero_pool_stats(uint64_t out[7]);
+// MKW_FILL_WINDOW: units' first contents written through one shared window, unmapped once per 32 (ps5_memory.c)
+int ps5_mem_fill_window(int on);
+uint64_t ps5_mem_fill_window_flushes(void);   // since the last call
 // MKW_MAP_PROBE: one 2 MiB fixed map against 32 of 64 KiB, their unmaps, a part released on its own; the line into out
 void ps5_mem_map_probe(char *out, size_t cap);
 // Direct memory for the runtime's own use (MKW_PACK's store) at an OS-chosen address aligned to align: bytes and align

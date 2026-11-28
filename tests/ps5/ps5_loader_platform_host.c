@@ -36,18 +36,32 @@ static void *reserve_at(uint64_t address, size_t bytes, int protection) {
     return p;
 }
 
+static uintptr_t windows[8][2];   // the system-chosen reservations: a unit is filled there, so it may be stale first
+static int nwindows;
+static bool in_window(uintptr_t a) {
+    for (int i = 0; i < nwindows; i++)
+        if (a >= windows[i][0] && a < windows[i][1]) return true;
+    return false;
+}
+
 int32_t sceKernelReserveVirtualRange(void **address, size_t bytes, int flags, size_t alignment) {
     uint64_t at = (uintptr_t)*address;
     assert(!flags && alignment == UNIT && !(at % UNIT) && !(bytes % UNIT));
-    if (!at) {   // the system's choice (the zero pool's window), aligned as asked
+    if (!at) {   // the system's choice (the zero pool's and the fill's windows), aligned as asked
         uint8_t *q = mmap(NULL, bytes + UNIT, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         assert(q != MAP_FAILED);
         uint8_t *a = (uint8_t *)(((uintptr_t)q + UNIT - 1) & ~(uintptr_t)(UNIT - 1));
         if (a > q) munmap(q, (size_t)(a - q));
         munmap(a + bytes, (size_t)(q + bytes + UNIT - (a + bytes)));
         *address = a;
+        if (nwindows < 8) windows[nwindows][0] = (uintptr_t)a, windows[nwindows++][1] = (uintptr_t)a + bytes;
         return 0;
     }
+    for (int i = 0; i < nwindows; i++)   // a window reserved again in place
+        if (at == windows[i][0]) {
+            *address = reserve_at(at, bytes, PROT_NONE);
+            return 0;
+        }
     if (at == hint) {
         *address = reserve_at(unexpected, bytes, PROT_NONE);
         pending = true;
@@ -148,7 +162,8 @@ int32_t sceKernelMapDirectMemory(void **address, size_t bytes, int protection, i
     assert((uintptr_t)*address != unexpected && (!foreign || (uintptr_t)*address != sample));
     // Nothing stale may be seen at the guest address, even for an instant: the unit is filled before this map.
     const uint64_t *w = (const uint64_t *)(phys + offset);
-    for (size_t k = 0; k < UNIT / sizeof *w; ++k) assert(w[k] != STALE);
+    if (in_window((uintptr_t)*address)) ++private_maps;   // the fill window's slot: the map that writes first contents
+    for (size_t k = 0; !in_window((uintptr_t)*address) && k < UNIT / sizeof *w; ++k) assert(w[k] != STALE);
     void *p = mmap(*address, bytes, protection, MAP_SHARED | MAP_FIXED, phys_fd, offset);
     assert(p == *address);
     return 0;
@@ -610,6 +625,25 @@ static void test_decommit_run(uint64_t addr) {
     puts("decommit run: three units released by one unmap, a half unit page by page; zero when committed again");
 }
 
+// MKW_FILL_WINDOW: fresh units zeroed and packed units' bytes written through the shared window read the same at their
+// guest addresses; a unit decommitted while its slot still maps it is released only after the window's flush; off,
+// the window goes and nothing stays allocated.
+static void test_fill_window(uint64_t addr) {
+    assert(!ps5_mem_fill_window(1));
+    unsigned before = live_allocations();
+    for (int round = 0; round < 8; round++) {   // 8 x 6 units: past the window's 32 slots
+        assert(plat_mem_commit(addr, 6 * UNIT) && plat_mem_back(addr, 6 * UNIT));
+        const uint64_t *w = (const uint64_t *)(uintptr_t)addr;
+        for (size_t k = 0; k < 6 * UNIT / sizeof *w; k++) assert(!w[k]);
+        memset((void *)(uintptr_t)addr, 0x3d, 6 * UNIT);
+        assert(plat_mem_decommit(addr, 6 * UNIT));
+        assert(live_allocations() == before);
+    }
+    assert(ps5_mem_fill_window_flushes() >= 1);
+    assert(!ps5_mem_fill_window(0));
+    puts("fill window: 48 units zeroed through the window, released after its flushes, nothing left allocated");
+}
+
 static void test_memory(void) {
     uint64_t boundary = sample + UNIT, tail = boundary - PAGE;
     uint64_t alias_end = RT_ALIAS_BASE + RT_ALIAS_SIZE;
@@ -626,6 +660,7 @@ static void test_memory(void) {
     test_prot_watch_subpage(RT_ALIAS_BASE + 48 * UNIT);
     test_zero_pool(RT_ALIAS_BASE + 52 * UNIT);
     test_decommit_run(RT_ALIAS_BASE + 56 * UNIT);
+    test_fill_window(RT_ALIAS_BASE + 64 * UNIT);
     assert(!allocations && !plat_mem_reserve(sample, UNIT, 0));
     assert(!plat_mem_reserve(hint, UNIT, 0));
     assert(!plat_mem_reserve(unexpected, UNIT, 0) && !plat_mem_commit(unexpected, PAGE));

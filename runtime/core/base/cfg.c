@@ -313,6 +313,7 @@ static const CfgRow rows[] = {
     K("FG_TEST"),
     K("FG_VBLANK"),
     K("FG_XWAIT"),
+    K("FILL_WINDOW"),
     K("FLIGHT_AT"),
     K("FLIGHT_DIR"),
     K("FLIGHT_FRAMES"),
@@ -757,6 +758,19 @@ static const struct { const char *key, *value; } PS5[] = {
     // ud-ab1): 1 % low 40.5 -> 42.7 and 41.8 -> 43.3 fps, 0.1 % low 19.1 -> 22.6 and 17.1 -> 25.1 fps, frames over 50 ms
     // 6 -> 3 and 5 -> 2, frame unchanged; races watched by the user looked clean.
     {"UNMAP_DEFER", "1"},
+    // Decommits release whole units up to 32 in a row with one unmap (ps5_guest_memory.c decommit_units): each unmap
+    // costs ~42 us on the console (MKW_MAP_PROBE), and the unmap thread held frz_lock ~47 ms over the game's 21 MiB
+    // pools. Five 150 s 1.8.0 Grand Prix against six without (dr_* / zp0_*, 28/11/2026): frames over 50 ms 2-6 (mean
+    // 4.2) against 5-9 (7.2), 0.1 % low 22.1-26.2 against 19.5-22.9 fps, no slow thaw or MapPhysicalMemory left; races
+    // watched by the user looked clean.
+    {"DECOMMIT_RUN", "1"},
+    // Units' first contents (unpacks, fresh zeros) are written through one shared window unmapped once per 32 units
+    // instead of a private map each (ps5_memory.c fill_window): the unpack frames carried ~17 ms of private maps beside
+    // their decompression. Three 150 s 1.8.0 Grand Prix with DECOMMIT_RUN (drf_*, 28/11/2026): frames over 50 ms 2 / 4
+    // / 1 against 2-6 with DECOMMIT_RUN alone, 1 % low 43.9-44.7 against 39.6-44.8, 0.1 % low 26.0-27.7. The user
+    // watched all three in PXPlay: two clean, a couple of black texture flashes in drf_2 (none in the DECOMMIT_RUN-only
+    // runs around it); added at the user's request, 28/11/2026.
+    {"FILL_WINDOW", "1"},
     // The console's own controller: PlayStation icons rather than auto, which guesses from the pad's labels (Xbox when
     // it reports none), and the DualSense's vibration at 100 % (the table's 130 % suits PC pads; asked for by the user,
     // 24/11/2026). Both stay in Pit Stop > Controls.

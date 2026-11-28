@@ -167,6 +167,7 @@ __attribute__((weak)) void plat_mem_protect_stats(void (*emit)(uintptr_t, uint64
 __attribute__((weak)) int plat_mem_unpack_batch_mode(int on) { (void)on; return -1; }
 __attribute__((weak)) int plat_mem_zero_pool_mode(int on) { (void)on; return -1; }
 __attribute__((weak)) int plat_mem_decommit_run_mode(int on) { (void)on; return -1; }
+__attribute__((weak)) int plat_mem_fill_window_mode(int on) { (void)on; return -1; }
 __attribute__((weak)) int plat_mem_map_probe(char *out, size_t cap) { (void)out, (void)cap; return 0; }
 __attribute__((weak)) void plat_mem_zero_pool_stats(uint64_t out[7]) { memset(out, 0, 7 * sizeof *out); }
 __attribute__((weak)) int plat_mem_storm_take(char *out, size_t cap, uint32_t min_faults) {

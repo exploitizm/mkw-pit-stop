@@ -31,8 +31,57 @@ static int reserve_exact(Ps5MemBlock *block, uintptr_t address) {
 
 static bool zp_give(int64_t physical);
 
+// ---- MKW_FILL_WINDOW (default 0, 1 in the PS5 profile; ps5_mem_fill_window): a unit's first contents (an unpack's bytes, a
+// fresh unit's zeros) are written through a slot of one shared 2 MiB window instead of a private map of its own, and
+// the window is unmapped once per 32 units. Each private map's unmap cost ~42 us alone (MKW_MAP_PROBE, 28/11/2026)
+// and more under load: the race's 50-73 ms unpack frames carried 17 ms of private maps beside 35 ms of decompression
+// (dr_1 frame 8474), read faults of the vk replay thread on units MKW_PACK had packed a lap before. A slot keeps its
+// unit mapped (unused) until the flush, so a unit's physical memory is never given back or recycled while a slot still
+// holds it: release_physical flushes first. Spin-locked: fills run in the fault handler. Lock order: unit, then fw.
+enum { FW_UNITS = 32 };
+static volatile int fw_on;
+static char fw_spin;
+static void *fw_va;                 // fw_spin: the window, NULL none yet (or lost)
+static int64_t fw_phys[FW_UNITS];   // fw_spin: the units in its slots
+static int fw_n;                    // fw_spin
+static uint64_t fw_flushes;
+static void fw_lock(void) { while (__atomic_test_and_set(&fw_spin, __ATOMIC_ACQUIRE)) {} }
+static void fw_unlock(void) { __atomic_clear(&fw_spin, __ATOMIC_RELEASE); }
+static void fw_flush_locked(void) {
+    if (!fw_n) return;
+    size_t win = (size_t)FW_UNITS * PS5_MEM_UNIT;
+    if (sceKernelMunmap(fw_va, win)) {   // the slots stay mapped: no more fills through it, and none released while aliased
+        static int said;
+        if (!said++) fprintf(stderr, "PS5 memory: fill window: unmapping it failed; fills go back to private maps\n");
+        __atomic_store_n(&fw_on, 0, __ATOMIC_RELEASE);
+        return;   // fw_n kept: release_physical still finds those units (and fails to flush them: leaked, never reused)
+    }
+    __atomic_add_fetch(&fw_flushes, 1, __ATOMIC_RELAXED);
+    fw_n = 0;
+    void *again = fw_va;
+    if (sceKernelReserveVirtualRange(&again, win, 0, PS5_MEM_UNIT) || again != fw_va) {
+        if (again && again != fw_va) sceKernelMunmap(again, win);
+        fw_va = NULL;   // reserved afresh at the next fill
+    }
+}
+// false: a slot still maps the unit and the window could not be unmapped (the unit must stay allocated)
+static bool fw_forget(int64_t physical) {
+    if (!__atomic_load_n(&fw_n, __ATOMIC_ACQUIRE)) return true;
+    bool ok = true;
+    fw_lock();
+    for (int i = 0; i < fw_n; i++)
+        if (fw_phys[i] == physical) {
+            fw_flush_locked();
+            ok = !fw_n;
+            break;
+        }
+    fw_unlock();
+    return ok;
+}
+
 static int release_physical(Ps5MemBlock *block) {
     if (!block->allocated) return 0;
+    if (!fw_forget(block->physical)) return PS5_MEM_RELOCATED;   // still mapped in the fill window: kept
     if (zp_give(block->physical)) {   // MKW_ZERO_POOL: kept, zeroed off the game's path, handed to the next commit
         block->allocated = false;
         return 0;
@@ -84,7 +133,60 @@ void ps5_mem_commit_times(uint64_t out[PS5_COMMIT_N]) {
     for (int i = 0; i < PS5_COMMIT_N; i++) out[i] = __atomic_load_n(&commit_ns[i], __ATOMIC_RELAXED);
 }
 
+// MKW_FILL_WINDOW: the same through a slot of the shared window; 1 when the window could not take it (no change made).
+static int fill_window(Ps5MemBlock *block, Ps5MemCommitReport *report, int (*fill)(void *ctx, void *unit), void *ctx,
+                       int *result) {
+    if (!__atomic_load_n(&fw_on, __ATOMIC_ACQUIRE)) return 1;
+    uint64_t t0 = plat_now_ns();
+    fw_lock();
+    size_t win = (size_t)FW_UNITS * PS5_MEM_UNIT;
+    if (!fw_va) {
+        void *v = NULL;
+        if (!sceKernelReserveVirtualRange(&v, win, 0, PS5_MEM_UNIT) && v) fw_va = v;
+    }
+    if (fw_va && fw_n == FW_UNITS) fw_flush_locked();
+    if (!fw_va || fw_n == FW_UNITS || !__atomic_load_n(&fw_on, __ATOMIC_ACQUIRE)) {
+        fw_unlock();
+        return 1;
+    }
+    void *slot = (char *)fw_va + (size_t)fw_n * PS5_MEM_UNIT, *at = slot;
+    int rc = sceKernelMapDirectMemory(&at, PS5_MEM_UNIT, cpu_rw, PS5_KERNEL_MAP_FIXED, block->physical, PS5_MEM_UNIT);
+    if (rc || at != slot) {
+        if (!rc && at && sceKernelMunmap(at, PS5_MEM_UNIT)) block->relocated = at;   // as fill_private does
+        fw_unlock();
+        if (block->relocated) {
+            *result = PS5_MEM_RELOCATED;
+            return 0;
+        }
+        return 1;
+    }
+    fw_phys[fw_n] = block->physical;
+    __atomic_store_n(&fw_n, fw_n + 1, __ATOMIC_RELEASE);
+    uint64_t t1 = plat_now_ns();
+    int r = fill ? fill(ctx, slot) : (memset(slot, 0, PS5_MEM_UNIT), 0);
+    uint64_t t2 = plat_now_ns();
+    fw_unlock();
+    COMMIT_ADD(PS5_COMMIT_PRIVMAP, t1 - t0);
+    COMMIT_ADD(PS5_COMMIT_FILL, t2 - t1);
+    if (report) report->private_status = 0;
+    *result = r;
+    return 0;
+}
+
+int ps5_mem_fill_window(int on) {
+    __atomic_store_n(&fw_on, on ? 1 : 0, __ATOMIC_RELEASE);
+    if (!on) {   // the slots go now: nothing lingers mapped while off
+        fw_lock();
+        fw_flush_locked();
+        fw_unlock();
+    }
+    return 0;
+}
+uint64_t ps5_mem_fill_window_flushes(void) { return __atomic_exchange_n(&fw_flushes, 0, __ATOMIC_RELAXED); }
+
 static int fill_private(Ps5MemBlock *block, Ps5MemCommitReport *report, int (*fill)(void *ctx, void *unit), void *ctx) {
+    int wres;
+    if (!fill_window(block, report, fill, ctx, &wres)) return wres;
     void *at = NULL;
     uint64_t t0 = plat_now_ns();
     int result = sceKernelMapDirectMemory(&at, PS5_MEM_UNIT, cpu_rw, 0, block->physical, PS5_MEM_UNIT);

@@ -436,6 +436,7 @@ static bool native_rw(const Ps5MixedBlock *unit, uint64_t off) {
 static volatile int back_batch_on;
 static uint64_t back_total_ns;   // every backing's whole time (plat_mem_cost_ns)
 int plat_mem_zero_pool_mode(int on) { return ps5_mem_zero_pool(on); }
+int plat_mem_fill_window_mode(int on) { return ps5_mem_fill_window(on); }
 int plat_mem_map_probe(char *out, size_t cap) {
     ps5_mem_map_probe(out, cap);
     return 1;
@@ -971,8 +972,8 @@ static Ps5MixedBlock *find_unit(VmRange *range, uint64_t address, bool create) {
     return &chunk[uidx];
 }
 
-// MKW_DECOMMIT_RUN (perf.c, "ab"): a decommit releases whole units with backing up to 32 in a row with one unmap
-// (ps5_mem_decommit_run) instead of one unmap per unit after a protection change per native page. Each unmap costs
+// MKW_DECOMMIT_RUN (perf.c, 1 in the PS5 profile): a decommit releases whole units with backing up to 32 in a row
+// with one unmap (ps5_mem_decommit_run) instead of one unmap per unit after a protection change per native page. Each unmap costs
 // ~42 us on the console where one of 2 MiB costs 14.5 (MKW_MAP_PROBE, 28/11/2026): the deferred release of the game's
 // 21 MiB pools held frz_lock ~47 ms, and the write-back thaws and the game's next MapPhysicalMemory waited behind it
 // (the race's 60-95 ms frames). 0 none, -1 the decommit failed.
