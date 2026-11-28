@@ -9,8 +9,8 @@ business, and nothing of it lives in this repo. The software keyboard's number p
 
 A plugin can also be linked into the executable instead: `build.py --plugin DIR` (Linux) or
 `tools/ps5/build_game.py --plugin DIR`, the only way on PS5, which loads no libraries. The folder holds the plugin's
-sources as its library build would compile them (or a `plugin.list` naming the mod and its sources, for a plugin
-whose folder also holds another platform's files); `tools/build/plugin_glue.py` builds it into one object whose only
+sources as its library build would compile them (or a `plugin.list` naming the mod, its sources and its own `cflags=` /
+`cxxflags=`, for a plugin whose folder also holds another platform's files); `tools/build/plugin_glue.py` builds it into one object whose only
 global name is its `mkw_plugin_init`, renamed per folder, so its own names never meet the runtime's. A linked plugin
 stands for the mod of its folder's name (`mods/<name>`, created if missing, and its settings), gets the same table
 and starts first, before the Mods page's libraries, whatever that page says: the build chose it. On PS5 it is told
