@@ -303,15 +303,31 @@ void vk_texture_compute_written(int id, VkCommandBuffer cb) {
     // the image is copied for the write-back right after the dispatch (readback_record_locked).
     if (id < 0 || id >= (1 << 20)) return;
     lock();
+    int perf = (rt_trace & RT_TRACE_PERF) != 0;
+    uint64_t t0 = perf ? kern_now_ns() : 0, t1 = 0, t2 = 0, t3 = 0;
     view_t v;
     int hv = 0;
     const VkTexImage *pub = vk_texture_by_id_locked(id, &v, &hv);
     if (pub) {
         Tex *e = (Tex *)pub;   // pub is Tex's first member
         uint64_t other = e->rb_other;
+        if (perf) t1 = kern_now_ns();
         gpu_written_locked(e, 1);
+        if (perf) t2 = kern_now_ns();
         e->rb_other = other;   // a dispatch: not another kind of write
         readback_record_locked(e, cb);
+        if (perf) t3 = kern_now_ns();
+        // MKW_TRACE=perf: a hold of 2 ms or more, by part (the lock-holder log of 28/11/2026 found holds of 33 ms here
+        // three times a race, the replay waiting behind them)
+        if (perf && t3 - t0 >= 2000000ull) {
+            static volatile int32_t logged;
+            if (__atomic_add_fetch(&logged, 1, __ATOMIC_RELAXED) <= 100)
+                rt_log("vk: compute_written held tex_lock %.1f ms: check %.1f, gpu_written (make_fresh, baseline) %.1f, "
+                       "readback %.1f; texture %#llx %ux%u fmt %#x, %llu bytes, uploads %u, mirrored %d",
+                       (t3 - t0) / 1e6, (t1 - t0) / 1e6, (t2 - t1) / 1e6, (t3 - t2) / 1e6,
+                       (unsigned long long)e->pub.addr, e->t.d.width, e->t.d.height, e->t.d.format,
+                       (unsigned long long)e->t.L.size, e->n_up, e->pub.mirrored);
+        }
     }
     unlock();
 }
