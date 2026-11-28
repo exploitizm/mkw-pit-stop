@@ -345,15 +345,16 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
 #define COPY_SWEEP_SUBMITS 600
 static uint64_t copies_marked, copy_drop_mark, copy_drop_gone, copy_sweeps;
 
+// "ab": marks written and swept in the B blocks only (MKW_AB), to measure the sweeps' cost in one run.
 static int copy_marks_on(void) {
     static int v = -1;
     if (v < 0) {
-        const char *e = cfg_get("MKW_COPY_MARKS");
-        v = !(e && !strcmp(e, "0"));
-        rt_log("nvn: recording copy marks %s (MKW_COPY_MARKS)", v ? "on: a copy goes when the game overwrites its control memory"
+        v = rt_knob("COPY_MARKS", "1");
+        rt_log("nvn: recording copy marks %s (MKW_COPY_MARKS)", v == 2 ? "ab: in the B blocks only"
+                                                              : v ? "on: a copy goes when the game overwrites its control memory"
                                                                   : "off: copies go only when their control memory is added again");
     }
-    return v;
+    return RT_KNOB_ON(v);
 }
 
 static void copy_mark_write(uintptr_t at, const uint8_t *copy) {
@@ -503,14 +504,14 @@ static void pin_collect_ops(ptr_set *s, const uint8_t *p, uint64_t bytes) {   //
     }
 }
 
+// "ab": sweeps in the B blocks only (MKW_AB).
 static int pin_sweep_on(void) {
     static int v = -1;
     if (v < 0) {
-        const char *e = cfg_get("MKW_PIN_SWEEP");
-        v = !(e && !strcmp(e, "0"));
-        rt_log("nvn: texture pin sweep %s (MKW_PIN_SWEEP)", v ? "on" : "off: pins kept for the run");
+        v = rt_knob("PIN_SWEEP", "1");
+        rt_log("nvn: texture pin sweep %s (MKW_PIN_SWEEP)", v == 2 ? "ab: in the B blocks only" : v ? "on" : "off: pins kept for the run");
     }
-    return v;
+    return RT_KNOB_ON(v);
 }
 
 // Handed from the replay thread to the sweeper: the replay's render targets at the sweep point.
