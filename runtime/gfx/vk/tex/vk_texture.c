@@ -49,6 +49,7 @@ uint64_t n_uploads, n_reuploads;
 // Re-uploads since the last perf line (tex_lock): all, those after WriteTexels, and subresources skipped by MKW_TEX_REUP_PARTIAL.
 uint64_t ru_n, ru_bytes, ru_ns, ru_wt_n, ru_wt_bytes, ru_wt_ns, ru_skip_sub, ru_skip_bytes;
 uint64_t tl_n, tl_ns, tl_max;       // lock() waits (MKW_TRACE=perf), vk_tex_internal.h
+uint64_t n_entries_made;
 volatile uint32_t tl_htid;           // the holder (vk_tex_internal.h tl_took)
 volatile uint64_t tl_hra, tl_ht0;
 const char *volatile tl_hname;

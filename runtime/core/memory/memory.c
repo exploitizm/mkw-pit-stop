@@ -877,6 +877,91 @@ uint32_t mem_unmap(uint64_t dst, uint64_t src, uint64_t n) { return stack_move(1
 
 // ---- 0x2C/0x2D MapPhysicalMemory, UnmapPhysicalMemory. Horizon maps only the still-unmapped pages of the range and
 // leaves mapped pages and their contents alone; TotK's heaps grow by re-mapping ranges they partly own.
+// MKW_UNMAP_DEFER (default 0 until measured, "ab"): UnmapPhysicalMemory's release of the pages (decommit) runs on the
+// "unmap" thread instead of the game's. Pool-churn log of 28/11/2026 (churn1, 1.8.0 GP): the game's 20-21 MiB pools
+// took 56-61 ms each to unmap on the game's own thread (~180 us per 64 KiB unit released), 3-4 a race at the same
+// stretch, the race's 50-90 ms frames. The game no longer touches what it unmapped; a map over a range whose release
+// is still pending first makes it (or waits for the thread's), so a mapping always starts from released, zeroed pages
+// as before. The thread takes frz_lock as decommit always did and not `lock`: the map path drains while it holds
+// `lock`, so a map and a release of one range never interleave. Not with the lazy commit (Windows): a fault there
+// commits alias pages outside this path.
+typedef struct { uint64_t a, n; int busy; } PendUnmap;
+enum { PEND_N = 64 };
+static PendUnmap pend[PEND_N];
+static int npend, pend_started;
+static PlatMutex pend_lock = PLAT_MUTEX_INIT;
+static PlatCond pend_cv = PLAT_COND_INIT, pend_done = PLAT_COND_INIT;
+static uint64_t pend_deferred, pend_drained;   // since the last line (mem_unmap_defer_stats)
+
+static void decommit(uint64_t a, uint64_t n, const char *what);
+
+static void unmap_main(void *arg) {
+    (void)arg;
+    plat_mutex_lock(&pend_lock);
+    for (;;) {
+        int i = 0;
+        while (i < npend && pend[i].busy) i++;
+        if (i == npend) {
+            plat_cond_wait(&pend_cv, &pend_lock);
+            continue;
+        }
+        pend[i].busy = 1;
+        uint64_t a = pend[i].a, n = pend[i].n;
+        plat_mutex_unlock(&pend_lock);
+        decommit(a, n, "physical memory (deferred)");
+        plat_mutex_lock(&pend_lock);
+        for (int k = 0; k < npend; k++)
+            if (pend[k].busy && pend[k].a == a && pend[k].n == n) { pend[k] = pend[--npend]; break; }
+        plat_cond_broadcast(&pend_done);
+    }
+}
+
+// under lock: 1 when [a, a+n)'s release went to the unmap thread
+static int unmap_defer(uint64_t a, uint64_t n) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("UNMAP_DEFER", "0");
+    if (lazy || !RT_KNOB_ON(mode)) return 0;
+    plat_mutex_lock(&pend_lock);
+    if (!pend_started) {
+        pend_started = plat_thread_spawn(unmap_main, NULL, "unmap", 0) ? 1 : -1;
+        if (pend_started > 0) rt_log("memory: UnmapPhysicalMemory releases on their own thread%s (MKW_UNMAP_DEFER)",
+                                     mode == 2 ? " in the B blocks" : "");
+    }
+    int ok = pend_started > 0 && npend < PEND_N;
+    if (ok) pend[npend++] = (PendUnmap){a, n, 0}, pend_deferred++, plat_cond_broadcast(&pend_cv);
+    plat_mutex_unlock(&pend_lock);
+    return ok;
+}
+
+// under lock, before a map over [a, a+n): the releases pending there are made first
+static void unmap_drain(uint64_t a, uint64_t n) {
+    if (!__atomic_load_n(&npend, __ATOMIC_ACQUIRE)) return;
+    plat_mutex_lock(&pend_lock);
+    for (;;) {
+        int i = 0;
+        while (i < npend && !overlaps(a, n, pend[i].a, pend[i].n)) i++;
+        if (i == npend) break;
+        if (pend[i].busy) {   // the thread is releasing it: wait for it
+            plat_cond_wait(&pend_done, &pend_lock);
+            continue;
+        }
+        uint64_t pa = pend[i].a, pn = pend[i].n;
+        pend[i] = pend[--npend];
+        pend_drained++;
+        plat_mutex_unlock(&pend_lock);
+        decommit(pa, pn, "physical memory (drained)");
+        plat_mutex_lock(&pend_lock);
+    }
+    plat_mutex_unlock(&pend_lock);
+}
+
+void mem_unmap_defer_stats(uint64_t *deferred, uint64_t *drained) {
+    plat_mutex_lock(&pend_lock);
+    *deferred = pend_deferred, *drained = pend_drained;
+    pend_deferred = pend_drained = 0;
+    plat_mutex_unlock(&pend_lock);
+}
+
 static void alias_runs(uint64_t first, uint64_t count, uint8_t want, int do_commit) {   // under lock
     uint64_t i = 0;
     while (i < count) {
@@ -887,7 +972,7 @@ static void alias_runs(uint64_t first, uint64_t count, uint8_t want, int do_comm
         if (do_commit) {
             if (!lazy) commit(a, n, "physical memory");
         }
-        else decommit(a, n, "physical memory");
+        else if (!unmap_defer(a, n)) decommit(a, n, "physical memory");
         memset(alias_pages + first + i, !want, j - i);
         i = j;
     }
@@ -897,7 +982,11 @@ static uint32_t alias_map(int unmap, uint64_t a, uint64_t n) {
     if (!n || ((a | n) & (PAGE - 1))) return R_INVALID_ADDRESS;
     if (!inside(a, n, L.alias)) return R_INVALID_REGION;
     uint64_t first = (a - L.alias.base) / PAGE, count = n / PAGE;
+    // MKW_TRACE=perf: a call of 5 ms or more is logged (the game's own thread waits for it: its pool churn at a race's
+    // 50-90 ms frames, stall trace of 28/11/2026)
+    uint64_t am_t0 = (rt_trace & RT_TRACE_PERF) ? plat_now_ns() : 0;
     plat_mutex_lock(&lock);
+    uint64_t am_t1 = am_t0 ? plat_now_ns() : 0;
     uint32_t r = R_OK;
     if (unmap) {
         for (unsigned i = 0; i < nstack_maps; i++)
@@ -916,11 +1005,21 @@ static uint32_t alias_map(int unmap, uint64_t a, uint64_t n) {
             r = R_LIMIT_REACHED;   // the SDK maps LimitReached to its recoverable out-of-memory result
             goto out;
         }
+        unmap_drain(a, n);   // (MKW_UNMAP_DEFER)
         alias_runs(first, count, 0, 1);
         alias_bytes += fresh * PAGE;
     }
 out:
     plat_mutex_unlock(&lock);
+    if (am_t0 && plat_now_ns() - am_t0 >= 5000000ull) {
+        static volatile int32_t logged;
+        char who[24] = "?";
+        plat_sample_self_name(who, sizeof who);
+        if (__atomic_add_fetch(&logged, 1, __ATOMIC_RELAXED) <= 200)
+            rt_log("memory: slow %sMapPhysicalMemory %#llx+%#llx (%.1f MiB) by %s: %.1f ms (lock wait %.1f)",
+                   unmap ? "Un" : "", (unsigned long long)a, (unsigned long long)n, n / 1048576.0, who,
+                   (plat_now_ns() - am_t0) / 1e6, (am_t1 - am_t0) / 1e6);
+    }
     if (r) rt_log("%sMapPhysicalMemory %#llx+%#llx failed %#x (alias %#llx used, heap %#llx)", unmap ? "Un" : "",
                   (unsigned long long)a, (unsigned long long)n, r, (unsigned long long)alias_bytes,
                   (unsigned long long)heap_size);

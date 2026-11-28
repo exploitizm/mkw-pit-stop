@@ -172,6 +172,14 @@ static void late_note(int id, const TexSlot *s) {
 
 static const VkTexImage *by_id(int id, view_t *view, int *has_view, int sampled);
 
+// MKW_TRACE=perf: slots resolved again under tex_lock, and of them those that made a new entry (entry_of), read and
+// reset by vk_texture_resolve_stats (vk_exec_par.c precheck's slow-pass line)
+static uint64_t rs_n, rs_ns, rs_new, rs_new_ns;
+void vk_texture_resolve_stats(uint64_t *n, uint64_t *ns, uint64_t *made, uint64_t *made_ns) {
+    *n = rs_n, *ns = rs_ns, *made = rs_new, *made_ns = rs_new_ns;
+    rs_n = rs_ns = rs_new = rs_new_ns = 0;
+}
+
 const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) { return by_id(id, view, has_view, 1); }
 const VkTexImage *vk_texture_storage_by_id_locked(int id, view_t *view, int *has_view) {
     return by_id(id, view, has_view, 0);
@@ -185,7 +193,13 @@ static const VkTexImage *by_id(int id, view_t *view, int *has_view, int sampled)
     if (!s->ce || s->cgen != g) {   // resolved again: an entry at its address was created, dropped or released, or the
         view_t v;                   // slot registered (s->ce cleared); an empty result is not kept: image creation may
         int hv;                     // succeed later
+        uint64_t r0 = (rt_trace & RT_TRACE_PERF) ? kern_now_ns() : 0, nb = r0 ? n_entries_made : 0;
         s->ce = slot_resolve(s, &v, &hv);   // entry_of may create an entry and bump g: g read before it
+        if (r0) {
+            uint64_t d = kern_now_ns() - r0;
+            rs_n++, rs_ns += d;
+            if (n_entries_made != nb) rs_new += n_entries_made - nb, rs_new_ns += d;
+        }
         s->cview = v, s->chas_view = (uint8_t)hv;
         s->cgen = g;
         s->cepoch = 0;

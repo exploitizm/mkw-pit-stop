@@ -244,6 +244,7 @@ extern uint32_t vk_tex_reg_limit;
 void vk_sampler_register(int id, const samp_par *s);                // sampler descriptor slot (copied)
 uint64_t vk_texture_trim_gov(uint64_t bytes);   // the governor's: idle longer, oldest first, the lock released between batches
 uint64_t vk_texture_trim(uint64_t bytes);      // out of memory: released and idle mirrored textures go (vk_staging)
+void vk_texture_resolve_stats(uint64_t *n, uint64_t *ns, uint64_t *made, uint64_t *made_ns);   // tex_lock held
 int vk_texture_precheck_par(const uint32_t *ids, int n, uint32_t ep);   // MKW_PRECHECK_PAR, tex_lock held: slots checked
 uint64_t vk_texture_trim_released(uint64_t keep_bytes); // shed released-texture cache down to keep_bytes
 void vk_texture_release(const tex_t *t);   // TextureFinalize: the image stays for slots that still name its storage

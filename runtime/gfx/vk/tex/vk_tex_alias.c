@@ -145,6 +145,7 @@ Tex *entry_of(const tex_t *t) {
         }
         if (!(e = create_tex(t, &k, tex_alias))) return NULL;
         perf_count(PERF_CNT_TEX_NEW);
+        n_entries_made++;
         // released entries of another descriptor at this address are replaced by the new one; a live one holding
         // GPU-written content is the alias source, preferring the one that differs only in swizzle (same_but_swizzle)
         int alias = 0;

@@ -484,6 +484,7 @@ static const CfgRow rows[] = {
     K("TRACE_UBO"),
     K("TRACE_UBO_OUT"),
     K("UBO_SNAPSHOT"),
+    K("UNMAP_DEFER"),
     K("UNPACK_BATCH"),
     K("UPDATE_AS"),
     K("UPDATE_REPO"),
