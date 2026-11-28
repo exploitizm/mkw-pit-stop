@@ -35,7 +35,8 @@ END = ("bench: result", "race: out of the race", "bench: no finish seen", "bench
 # replay did; the precheck pass holds uploads and texture-lock waits; an upload holds its ASTC decode.
 CHILDREN = {
     "sync_replay": ["replay"],
-    "replay": ["precheck", "texlock", "upload", "astc", "sparse", "gov"],
+    "replay": ["replay_walk", "replay_chunks", "precheck", "texlock", "upload", "astc", "sparse", "gov"],
+    "replay_walk": ["precheck"],
     "precheck": ["upload", "texlock"],
     "upload": ["astc"],
 }
@@ -60,8 +61,8 @@ def classify(
 ):
     """The cause of one slow frame: the cost that grew the most over its normal, followed down to the part that holds
     at least half of that growth. Under a quarter of the frame's excess explained: the game's own CPU or the GPU."""
-    # (prot_calls is a count, not a cost)
-    extra = {k: v - base.get(k, 0.0) for k, v in costs.items() if not k.endswith("_calls")}
+    # (prot_calls and draws_n are counts, not costs)
+    extra = {k: v - base.get(k, 0.0) for k, v in costs.items() if not k.endswith(("_calls", "_n"))}
     extra.update({f"render {k}": v for k, v in blocked.items() if k in BLOCKED})
     if extra:
         name = max(extra, key=lambda k: extra[k])

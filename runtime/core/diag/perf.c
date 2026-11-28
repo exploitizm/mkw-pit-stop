@@ -115,8 +115,10 @@ void perf_replay(uint64_t t0) {
 // it: with the game a frame ahead of the replay, a slow frame's ledger holds the game's next frame and the replay of
 // its own, which is what ran in its period.
 static volatile int64_t ledger[PERF_LG_N];
-static const char *const ledger_name[PERF_LG_N] = {"sync_replay", "sync_gpu", "texlock", "upload", "astc",
-                                                   "precheck",    "early",    "gov",     "capture", "sparse"};
+static const char *const ledger_name[PERF_LG_N] = {"sync_replay", "sync_gpu",   "texlock",       "upload",
+                                                   "astc",        "precheck",   "early",         "gov",
+                                                   "capture",     "sparse",     "replay_walk",   "replay_chunks",
+                                                   "draws_n"};
 
 void perf_ledger(int kind, uint64_t ns) {
     if (ns && __atomic_load_n(&perf_on, __ATOMIC_RELAXED)) plat_add64(&ledger[kind], (int64_t)ns);
@@ -134,7 +136,7 @@ static void ledger_fmt(char *out, size_t cap, const uint64_t *ns, double div) {
     size_t o = 0;
     out[0] = 0;
     for (int i = 0; i < LG_ALL && o < cap; i++) {
-        int count = i == LG_PLAT + PLAT_MEM_COST_PROT_CALLS;   // a count, not ns
+        int count = i == LG_PLAT + PLAT_MEM_COST_PROT_CALLS || i == PERF_LG_DRAWS;   // a count, not ns
         double ms = (double)ns[i] / (count ? 1.0 : 1e6) / div;
         if (ms >= 0.05) o += (size_t)snprintf(out + o, cap - o, " %s %.2f", i < PERF_LG_N ? ledger_name[i] : extra[i - PERF_LG_N], ms);
     }

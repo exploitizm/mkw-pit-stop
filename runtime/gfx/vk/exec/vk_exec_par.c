@@ -927,6 +927,8 @@ int vk_exec_par(VkExec *ex, const uint64_t *handles, int n, int diag) {
     vk_exec_draw_new_cb();
     vk_exec_qs = P.wq;   // (the next part of a queue order episode goes on from them)
     P.n_par++, P.n_chunks += (uint64_t)P.nch, P.n_draws += (uint64_t)P.plan_draws, P.walk_ns += t1 - t0, P.rec_ns += t2 - t1;
+    perf_ledger(PERF_LG_RWALK, t1 - t0), perf_ledger(PERF_LG_RCHUNKS, t2 - t1);
+    perf_ledger(PERF_LG_DRAWS, (uint64_t)P.plan_draws);
     if (t2 - t1 > P.max_rec_ns) P.max_rec_ns = t2 - t1;
     return 1;
 }

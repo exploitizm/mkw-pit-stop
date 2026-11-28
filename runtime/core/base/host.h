@@ -55,7 +55,10 @@ void perf_count(int kind);
 // only give window totals). Names in perf.c ledger_name. Page protection and PACK unpacks come from the platform
 // (plat_mem_cost_ns), the replay from perf_replay.
 enum { PERF_LG_SYNC_REPLAY, PERF_LG_SYNC_GPU, PERF_LG_TEXLOCK, PERF_LG_UPLOAD, PERF_LG_ASTC, PERF_LG_PRECHECK,
-       PERF_LG_EARLY, PERF_LG_GOV, PERF_LG_CAPTURE, PERF_LG_SPARSE, PERF_LG_N };
+       PERF_LG_EARLY, PERF_LG_GOV, PERF_LG_CAPTURE, PERF_LG_SPARSE,
+       // the replay's split (vk_exec_par.c): its walk (prescan, precheck, plan) and its wait for the chunks and their
+       // sends; PERF_LG_DRAWS is a count (the chunked submissions' draws), not ns
+       PERF_LG_RWALK, PERF_LG_RCHUNKS, PERF_LG_DRAWS, PERF_LG_N };
 void perf_ledger(int kind, uint64_t ns);
 void perf_present(uint64_t frame);
 void perf_summary_flush(void);                  // prints the frame-time summary of the running period (exit); the 60 s lines come from perf_present
