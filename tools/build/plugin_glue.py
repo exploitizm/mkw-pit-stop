@@ -15,6 +15,7 @@ and tools/ps5/build_game.py; not run on its own.
 """
 
 import re
+import shlex
 from pathlib import Path
 
 RUNTIME_PLUGIN = Path(__file__).resolve().parents[2] / "runtime/plugin"
@@ -23,14 +24,25 @@ RUNTIME_PLUGIN = Path(__file__).resolve().parents[2] / "runtime/plugin"
 LIST = "plugin.list"
 
 
-def read_list(folder: Path) -> tuple[str | None, list[Path]] | None:
-    """A folder's plugin.list, if it has one: `name=NAME` (the mod it stands for) and one source per line, relative to
-    the folder ('#' starts a comment). For a plugin whose sources sit beside others it must not build (another
-    platform's), or whose folder is not named after its mod. None without the file."""
+def list_flags(folder: Path, value: str) -> list[str]:
+    """A cflags= / cxxflags= value as arguments, its -I folders made absolute from the list's folder."""
+    out = []
+    for arg in shlex.split(value):
+        if arg.startswith("-I") and len(arg) > 2 and not Path(arg[2:]).is_absolute():
+            arg = "-I" + str((folder / arg[2:]).resolve())
+        out.append(arg)
+    return out
+
+
+def read_list(folder: Path) -> tuple[str | None, list[Path], list[str], list[str]] | None:
+    """A folder's plugin.list, if it has one: `name=NAME` (the mod it stands for), `cflags=` and `cxxflags=` (the
+    plugin's own flags for its C and C++, after the glue's; -I relative to the folder), and one source per line,
+    relative to the folder ('#' starts a comment, so a flag cannot hold one). For a plugin whose sources sit beside
+    others it must not build (another platform's), or whose folder is not named after its mod. None without the file."""
     path = folder / LIST
     if not path.is_file():
         return None
-    name, srcs = None, []
+    name, srcs, cflags, cxxflags = None, [], [], []
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.split("#", 1)[0].strip()
         if not line:
@@ -38,11 +50,17 @@ def read_list(folder: Path) -> tuple[str | None, list[Path]] | None:
         if line.startswith("name="):
             name = line[5:].strip()
             continue
+        if line.startswith("cflags="):
+            cflags += list_flags(folder, line[7:])
+            continue
+        if line.startswith("cxxflags="):
+            cxxflags += list_flags(folder, line[9:])
+            continue
         src = (folder / line).resolve()
         if src.suffix not in (".c", ".cpp") or not src.is_file():
             raise SystemExit(f"{path}: {line}: not a .c or .cpp file")
         srcs.append(src)
-    return name, srcs
+    return name, srcs, cflags, cxxflags
 
 
 def plugin_name(folder: Path) -> str:
@@ -52,8 +70,8 @@ def plugin_name(folder: Path) -> str:
     return re.sub(r"\W", "_", name)
 
 
-def plugin_sources(folders: list[Path]) -> list[tuple[str, Path, list[Path]]]:
-    """(name, folder, sources) of each folder: plugin.list's, else every .c and .cpp under it."""
+def plugin_sources(folders: list[Path]) -> list[tuple[str, Path, list[Path], list[str], list[str]]]:
+    """(name, folder, sources, cflags, cxxflags) of each folder: plugin.list's, else every .c and .cpp under it."""
     out, names = [], set()
     for folder in folders:
         if not folder.is_dir():
@@ -66,7 +84,7 @@ def plugin_sources(folders: list[Path]) -> list[tuple[str, Path, list[Path]]]:
         srcs = listed[1] if listed else sorted(p for pattern in ("*.c", "*.cpp") for p in folder.resolve().rglob(pattern))
         if not srcs:
             raise SystemExit(f"--plugin {folder}: no .c or .cpp files")
-        out.append((name, folder.resolve(), srcs))
+        out.append((name, folder.resolve(), srcs, listed[2] if listed else [], listed[3] if listed else []))
     return out
 
 
@@ -90,9 +108,9 @@ def plugin_ninja(folders: list[Path], out: Path, cc: str, cxx: str, flags: list[
     plugflags = " ".join([*flags, "-fvisibility=hidden", "-DMKW_PLUGIN_LINKED=1", f"-I{RUNTIME_PLUGIN}"])
     lines = [
         f"plugflags = {plugflags}",
-        (f"rule plugcc\n  command = {cc} -std=gnu11 $plugflags -I$plugdir -MD -MF $out.d -c $in -o $out"
+        (f"rule plugcc\n  command = {cc} -std=gnu11 $plugflags $plugc -I$plugdir -MD -MF $out.d -c $in -o $out"
          "\n  depfile = $out.d\n  deps = gcc\n  description = plugin $in"),
-        (f"rule plugcxx\n  command = {cxx} -std=c++17 $plugflags -I$plugdir -MD -MF $out.d -c $in -o $out"
+        (f"rule plugcxx\n  command = {cxx} -std=c++17 $plugflags $plugcxx -I$plugdir -MD -MF $out.d -c $in -o $out"
          "\n  depfile = $out.d\n  deps = gcc\n  description = plugin $in"),
         # step 2 and 3 of the module comment; the intermediate keeps a failed step from leaving a half-sealed object
         (f"rule plugseal\n  command = {ld} -r -o $out.part $in"
@@ -101,7 +119,7 @@ def plugin_ninja(folders: list[Path], out: Path, cc: str, cxx: str, flags: list[
          "\n  description = seal plugin $name"),
     ]  # fmt: skip
     sealed = []
-    for name, folder, srcs in plugin_sources(folders):
+    for name, folder, srcs, cflags, cxxflags in plugin_sources(folders):
         base = out / "plugin" / name
         objs = []
         for src in srcs:
@@ -109,7 +127,9 @@ def plugin_ninja(folders: list[Path], out: Path, cc: str, cxx: str, flags: list[
             obj = base / rel.with_suffix(".o")
             objs.append(str(obj))
             rule = "plugcxx" if src.suffix == ".cpp" else "plugcc"
-            lines.append(f"build {obj}: {rule} {src}\n  plugdir = {src.parent}")
+            own = shlex.join(cxxflags if rule == "plugcxx" else cflags).replace("$", "$$")
+            var = "plugcxx" if rule == "plugcxx" else "plugc"   # the rule's own-flags variable
+            lines.append(f"build {obj}: {rule} {src}\n  plugdir = {src.parent}\n  {var} = {own}")
         obj = base.with_suffix(".o")
         lines.append(f"build {obj}: plugseal {' '.join(objs)}\n  name = {name}")
         sealed.append(str(obj))
