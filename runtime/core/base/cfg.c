@@ -748,6 +748,11 @@ static const struct { const char *key, *value; } PS5[] = {
     // outside the commits' own steps 254 -> 71 and 435 -> 52 ms, 1 % low 42.0 -> 43.5 and 40.7 -> 44.2 fps, frames
     // over 33.3 ms 12 -> 14 and 20 -> 6, frame unchanged.
     {"UNPACK_BATCH", "1"},
+    // The game's UnmapPhysicalMemory releases its pages on the "unmap" thread (memory.c unmap_defer): its 20-21 MiB pools
+    // took 56-61 ms each to unmap on its own thread (churn1, 28/11/2026). In-race A/B, two 1.8.0 Grand Prix (ud-ab0 /
+    // ud-ab1): 1 % low 40.5 -> 42.7 and 41.8 -> 43.3 fps, 0.1 % low 19.1 -> 22.6 and 17.1 -> 25.1 fps, frames over 50 ms
+    // 6 -> 3 and 5 -> 2, frame unchanged; races watched by the user looked clean.
+    {"UNMAP_DEFER", "1"},
     // The console's own controller: PlayStation icons rather than auto, which guesses from the pad's labels (Xbox when
     // it reports none), and the DualSense's vibration at 100 % (the table's 130 % suits PC pads; asked for by the user,
     // 24/11/2026). Both stay in Pit Stop > Controls.

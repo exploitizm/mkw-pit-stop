@@ -877,7 +877,7 @@ uint32_t mem_unmap(uint64_t dst, uint64_t src, uint64_t n) { return stack_move(1
 
 // ---- 0x2C/0x2D MapPhysicalMemory, UnmapPhysicalMemory. Horizon maps only the still-unmapped pages of the range and
 // leaves mapped pages and their contents alone; TotK's heaps grow by re-mapping ranges they partly own.
-// MKW_UNMAP_DEFER (default 0 until measured, "ab"): UnmapPhysicalMemory's release of the pages (decommit) runs on the
+// MKW_UNMAP_DEFER (default 0, 1 in the PS5 profile: cfg.c has the A/B; "ab"): UnmapPhysicalMemory's release of the pages (decommit) runs on the
 // "unmap" thread instead of the game's. Pool-churn log of 28/11/2026 (churn1, 1.8.0 GP): the game's 20-21 MiB pools
 // took 56-61 ms each to unmap on the game's own thread (~180 us per 64 KiB unit released), 3-4 a race at the same
 // stretch, the race's 50-90 ms frames. The game no longer touches what it unmapped; a map over a range whose release
