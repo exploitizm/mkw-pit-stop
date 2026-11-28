@@ -908,7 +908,21 @@ static void unmap_main(void *arg) {
         pend[i].busy = 1;
         uint64_t a = pend[i].a, n = pend[i].n;
         plat_mutex_unlock(&pend_lock);
-        decommit(a, n, "physical memory (deferred)");
+        // MKW_UNMAP_SLICE (default 0 until measured, "ab"): a 2 MiB freeze region at a time, with a pause between, so a
+        // thread waiting for frz_lock takes it in between: whole, a 21 MiB release held it ~50 ms, and the completion
+        // thread's write-back thaw and the game's next MapPhysicalMemory (commit takes it too) waited 50-56 ms behind it
+        // (now1, 28/11/2026). Safe here as it was not on the map path: nobody reads a range the game unmapped, and a map
+        // over it drains first (busy: waits for this one).
+        static int slice = -1;
+        if (slice < 0) slice = rt_knob("UNMAP_SLICE", "0");
+        if (RT_KNOB_ON(slice))
+            for (uint64_t x = a, y; x < a + n; x = y) {
+                y = ((x + FRZ_SIZE) & ~(FRZ_SIZE - 1)) < a + n ? ((x + FRZ_SIZE) & ~(FRZ_SIZE - 1)) : a + n;
+                decommit(x, y - x, "physical memory (deferred)");
+                if (y < a + n) plat_sleep_ns(100000);
+            }
+        else
+            decommit(a, n, "physical memory (deferred)");
         plat_mutex_lock(&pend_lock);
         for (int k = 0; k < npend; k++)
             if (pend[k].busy && pend[k].a == a && pend[k].n == n) { pend[k] = pend[--npend]; break; }
