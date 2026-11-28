@@ -1,6 +1,7 @@
 // What memory.c shares with memory_early.c (MKW_EARLY_READ): the trap map and its lock. Not for other files.
 #ifndef MEMORY_INT_H
 #define MEMORY_INT_H
+#include "host.h"
 #include <stdint.h>
 
 #include "platform/platform.h"
@@ -10,8 +11,19 @@ extern PlatMutex frz_lock;
 // thaw_fault would answer by waiting for frz_lock on this very thread) stops with a named error instead of a silent
 // hang (run 25, t26-peek1).
 extern _Thread_local int frz_held;
-static inline void frz_take(void) { plat_mutex_lock(&frz_lock); frz_held++; }
-static inline void frz_drop(void) { frz_held--; plat_mutex_unlock(&frz_lock); }
+// MKW_TRACE=perf: who holds frz_lock (the outermost take notes its thread and site: frz_note, noinline so its return
+// address is the site), for mem_thaw's slow-call line. Slow-merge log of 28/11/2026: one-page thaws of 45-49 ms on the
+// completion thread, which holds the game's fence waiters.
+void frz_note(uintptr_t site);
+void frz_unnote(void);
+static inline void frz_take(void) {
+    plat_mutex_lock(&frz_lock);
+    if (!frz_held++ && (rt_trace & RT_TRACE_PERF)) frz_note((uintptr_t)__builtin_return_address(0));
+}
+static inline void frz_drop(void) {
+    if (!--frz_held && (rt_trace & RT_TRACE_PERF)) frz_unnote();
+    plat_mutex_unlock(&frz_lock);
+}
 extern uint8_t *trapped;                  // per guest page: 1 a read trap (memory.c), 2 an early-read watch, 3 a base
                                           // trap (memory_btrap.c), 4 a spilled page (memory_spill.c)
 extern int64_t mem_early_pages;           // frz_lock: pages watched now

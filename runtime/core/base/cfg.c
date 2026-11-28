@@ -451,6 +451,7 @@ static const CfgRow rows[] = {
     K("SPIN"),
     K("SPIN_HANDOFF_US"),
     K("SPIRV_RELEASE"),
+    K("STALL_TRACE"),
     K("STEAM_X11"),
     K("SVC_STATS"),
     K("SWKBD_ANSWER"),

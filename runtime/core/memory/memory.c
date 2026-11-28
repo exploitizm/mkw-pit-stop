@@ -17,6 +17,7 @@
 #include "gamelib.h"
 #include "platform/platform.h"
 #include "memory_int.h"
+#include "prof.h"
 
 #define PAGE 0x1000ull
 #define GiB (1ull << 30)
@@ -118,11 +119,43 @@ static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
     for (uint64_t r = r0; r <= r1; r++) thaw_locked(r, why);
 }
 
+static uint32_t frz_htid;      // the holder (frz_note), 0 none
+static uintptr_t frz_hsite;
+static uint64_t frz_ht0;
+static const char *frz_hname;
+static _Thread_local char frz_name[24];
+void frz_note(uintptr_t site) {
+    if (!frz_name[0] && !plat_sample_self_name(frz_name, sizeof frz_name)) snprintf(frz_name, sizeof frz_name, "?");
+    __atomic_store_n(&frz_hname, frz_name, __ATOMIC_RELAXED);
+    __atomic_store_n(&frz_hsite, site, __ATOMIC_RELAXED);
+    __atomic_store_n(&frz_ht0, plat_now_ns(), __ATOMIC_RELAXED);
+    __atomic_store_n(&frz_htid, plat_thread_id(), __ATOMIC_RELEASE);
+}
+void frz_unnote(void) { __atomic_store_n(&frz_htid, 0, __ATOMIC_RELEASE); }
+
 void mem_thaw(uint64_t a, uint64_t n) {
+    int perf = (rt_trace & RT_TRACE_PERF) != 0;
+    uint64_t t0 = perf ? plat_now_ns() : 0;
     mem_commit_range(a, n);   // a kernel write does not fault into lazy_fault
+    uint64_t t1 = perf ? plat_now_ns() : 0;
+    uint32_t htid = perf ? __atomic_load_n(&frz_htid, __ATOMIC_ACQUIRE) : 0;   // the holder as the wait begins
+    uintptr_t hsite = htid ? __atomic_load_n(&frz_hsite, __ATOMIC_RELAXED) : 0;
+    uint64_t ht0 = htid ? __atomic_load_n(&frz_ht0, __ATOMIC_RELAXED) : 0;
+    const char *hname = htid ? __atomic_load_n(&frz_hname, __ATOMIC_RELAXED) : NULL;
     frz_take();   // also when nothing is frozen: the hold keeps a read's buffer writable
+    uint64_t t2 = perf ? plat_now_ns() : 0;
     thaw_range_locked(a, n, 2);
     frz_drop();
+    if (perf && plat_now_ns() - t0 >= 5000000ull) {
+        static volatile int32_t logged;
+        char site[160] = "-";
+        if (hsite) prof_pc_describe(hsite, site, sizeof site);
+        if (__atomic_add_fetch(&logged, 1, __ATOMIC_RELAXED) <= 400)
+            rt_log("memory: slow thaw of %#llx+%#llx: %.1f ms (commit %.1f, frz_lock wait %.1f, thaw %.1f); frz_lock held by "
+                   "%s tid %#x for %.1f ms, taken at %s", (unsigned long long)a, (unsigned long long)n,
+                   (plat_now_ns() - t0) / 1e6, (t1 - t0) / 1e6, (t2 - t1) / 1e6, (plat_now_ns() - t2) / 1e6,
+                   htid ? (hname ? hname : "?") : "(none noted)", htid, htid && t1 > ht0 ? (t1 - ht0) / 1e6 : 0.0, site);
+    }
 }
 
 static void thaw_for_kernel(uint64_t a, size_t n) { if (watched(a, n)) mem_thaw(a, n); }   // plat_mem_thaw_hook
@@ -328,8 +361,14 @@ void mem_untrap(uint64_t a, uint64_t n) {
     frz_drop();
 }
 
-void mem_hold_layout(void) { plat_mutex_lock(&frz_lock); }
-void mem_release_layout(void) { plat_mutex_unlock(&frz_lock); }
+void mem_hold_layout(void) {
+    plat_mutex_lock(&frz_lock);
+    if (!frz_held && (rt_trace & RT_TRACE_PERF)) frz_note((uintptr_t)__builtin_return_address(0));
+}
+void mem_release_layout(void) {
+    if (!frz_held && (rt_trace & RT_TRACE_PERF)) frz_unnote();
+    plat_mutex_unlock(&frz_lock);
+}
 
 int mem_trapped(uint64_t a) { return trapped && a < RT_ADDRESS_LIMIT && __atomic_load_n(&trapped[a / PAGE], __ATOMIC_RELAXED) == 1; }
 
