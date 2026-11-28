@@ -17,7 +17,8 @@
 #include "gamelib.h"
 #include "platform/platform.h"
 #include "memory_int.h"
-#include "prof.h"
+
+const char *prof_pc_describe(uint64_t pc, char *buf, int n);   // prof.h (core/diag), for mem_thaw's slow-call line
 
 #define PAGE 0x1000ull
 #define GiB (1ull << 30)

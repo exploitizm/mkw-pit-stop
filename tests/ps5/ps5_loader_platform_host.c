@@ -226,6 +226,9 @@ static void check_early_page(uint64_t addr, uint32_t prot, int early) {
 
 PlatMutex frz_lock;
 _Thread_local int frz_held;
+unsigned rt_trace;   // memory_int.h: frz_take notes frz_lock's holder only with MKW_TRACE=perf (memory.c)
+void frz_note(uintptr_t site) { (void)site; }
+void frz_unnote(void) {}
 uint8_t *trapped;
 
 static uint64_t test_watch_addr;
